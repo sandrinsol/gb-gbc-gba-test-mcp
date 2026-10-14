@@ -51,7 +51,7 @@ try {
   const names = tools.map((t) => t.name);
   const ALL = ['load_rom', 'wait_frames', 'press', 'set_button', 'wait_until', 'reset', 'screenshot', 'read_memory',
     'read_cpu', 'read_sprites', 'view_vram', 'status', 'write_memory', 'save_state', 'load_state', 'set_cheats',
-    'battery_save', 'run_sequence', 'assert_golden', 'export_script', 'ab_compare', 'ram_search', 'record_video'];
+    'battery_save', 'run_sequence', 'assert_golden', 'export_script', 'ab_compare', 'ram_search', 'record_video', 'sprite'];
   for (const n of ALL) ok(`tool listed: ${n}`, names.includes(n));
   ok('exactly the documented tools', names.length === ALL.length, `${names.length}`);
   ok('screenshot is annotated read-only', tools.find((t) => t.name === 'screenshot').annotations?.readOnlyHint === true);
@@ -151,6 +151,34 @@ try {
   ok('emu://status resource', JSON.parse(res.contents[0].text).system === 'GBA');
   const scr = /** @type {any} */ (await client.readResource({ uri: 'emu://screen' }));
   ok('emu://screen resource is a PNG', decodePng(Buffer.from(scr.contents[0].blob, 'base64')).width === 240);
+
+  // --- Sprites: convert, inject, read back, golden, overlay, export ---
+  {
+    const data = new Uint8Array(16 * 16 * 4);
+    for (let i = 0; i < 256; i++) { const x = i % 16, y = i >> 4; if (x === 0 || y === 0 || x === 15 || y === 15 || x === y) data.set(x === y ? [0, 255, 0, 255] : [255, 0, 0, 255], i * 4); }
+    await writeFile(path.join(OUT, 'hero.png'), encodePng({ width: 16, height: 16, data, channels: 4 }));
+  }
+  await call('load_rom', { rom: 'anguna.gba' });
+  await call('wait_frames', { frames: 120 }); // title screen: the game leaves OAM 127 alone
+  r = await call('sprite', { action: 'convert', png: 'harness/out/mcp-test/hero.png', out: 'harness/out/mcp-test/hero.h', animation: 'harness/out/mcp-test/hero.gif' });
+  ok('sprite convert writes source + animation', !r.isError && existsSync(path.join(OUT, 'hero.h')) && existsSync(path.join(OUT, 'hero.gif')) && images(r).length === 1, textOf(r));
+  r = await call('sprite', { action: 'inject', png: 'harness/out/mcp-test/hero.png', x: 50, y: 40, oam: 127 });
+  ok('sprite inject (target from the ROM)', !r.isError && r.structuredContent.kept && /gba4/.test(textOf(r)) && images(r).length === 1, textOf(r).slice(0, 120));
+  r = await call('read_sprites', { all: true, overlay: false });
+  ok('read_sprites lists the injected sprite', /\n#127 50,40 16x16 t\d+ p0/.test(textOf(r)));
+  r = await call('assert_golden', { golden: 'harness/out/mcp-test/hero-sprite.png', sprite: 127 });
+  ok('assert_golden sprite: baseline', !r.isError && r.structuredContent.created);
+  r = await call('assert_golden', { golden: 'harness/out/mcp-test/hero-sprite.png', sprite: 127, threshold: 0 });
+  ok('assert_golden sprite: pass', !r.isError && r.structuredContent.pass, textOf(r));
+  r = await call('sprite', { action: 'export', index: 127, path: 'harness/out/mcp-test/exported.png' });
+  ok('sprite export', !r.isError && decodePng(await readFile(path.join(OUT, 'exported.png'))).width === 16);
+  r = await call('sprite', { action: 'overlay', png: 'harness/out/mcp-test/hero.png', x: 0, y: 0 });
+  ok('sprite overlay', !r.isError && images(r)[0]?.width === 480);
+  r = await call('sprite', { action: 'inject', png: 'harness/out/mcp-test/hero.png', target: 'gb' });
+  ok('sprite: wrong console refused', r.isError && /can't go into/.test(textOf(r)));
+  await call('run_sequence', { steps: [{ wait: 200 }, { tap: 'START', hold: 6, release: 120 }] }); // into gameplay
+  r = await call('sprite', { action: 'inject', png: 'harness/out/mcp-test/hero.png', x: 50, y: 40, oam: 0 });
+  ok('sprite inject reports when the game overwrites OAM', !r.isError && (r.structuredContent.kept || /rewrote OAM entry 0/.test(textOf(r))), textOf(r).slice(0, 100));
 
   // --- Video ---
   r = await call('record_video', { frames: 30, path: 'harness/out/mcp-test/clip.gif' });

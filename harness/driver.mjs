@@ -23,6 +23,8 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as gbaMem from './memory.mjs';
 import * as gbMem from './gb-memory.mjs';
+import { gbaSprites, gbSprites } from './video.mjs';
+import { renderSprite } from './sprite.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..'); // the repo root (served to the browser)
@@ -290,6 +292,13 @@ export class EmuHarness {
     await this._poke(state);
     return (await this.readMemory(addr, bytes.length)).equals(bytes);
   }
+  /** Patch the current state in one go: fn(stateCopy, memModule) edits it, then it
+   *  is loaded on the same frame (the picture is kept). */
+  async patchState(fn) {
+    const state = Buffer.from(await this._rawState());
+    await fn(state, this._mem);
+    await this._poke(state);
+  }
   async _poke(state) {
     this._state = null;
     await this.page.evaluate((b) => window.Emu.pokeState(b), state.toString('base64'));
@@ -320,6 +329,20 @@ export class EmuHarness {
     Buffer.from(data).copy(dst);
     await this._poke(state);
     if (reset) await this.restart();
+  }
+
+  // ---- Sprites ----
+  /** Decoded sprite table (see video.mjs gbaSprites / gbSprites). */
+  async sprites() {
+    const r = await this.readRegions();
+    return this.system === 'gba' ? gbaSprites(r) : gbSprites(r, { cgb: !!r.isCgbWram });
+  }
+  /** Sprite `index`'s graphics as an RGBA PNG, read from VRAM (independent of
+   *  what's behind it — handy for per-sprite golden checks). */
+  async spriteImage(index) {
+    const list = await this.sprites();
+    if (!list[index]) throw new Error(`no sprite ${index} (0-${list.length - 1})`);
+    return renderSprite(this.system, await this.readRegions(), list[index]);
   }
 
   // ---- Recording ----

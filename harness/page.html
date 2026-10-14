@@ -35,6 +35,9 @@
     window.EJS_disableAutoLang = false;
     window.EJS_threads = false;       // single-thread: deterministic, no COOP/COEP needed
     window.EJS_disableDatabases = true;
+    // Show the colours the game actually sets: no GBC "LCD look" colour
+    // correction, so screenshots match palette RAM (the play page keeps it).
+    window.EJS_defaultOptions = { gambatte_gbc_color_correction: 'disabled' };
 
     // --- Bridge ---
     const Emu = (window.Emu = {});

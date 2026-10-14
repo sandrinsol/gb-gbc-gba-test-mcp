@@ -9,6 +9,7 @@
 //   change   write_memory, save_state, load_state, set_cheats, battery_save
 //   test     run_sequence, assert_golden, export_script, ab_compare, record_video
 //   find     ram_search
+//   make     sprite (convert art, inject into the game, overlay, export)
 // The machine is paused between calls, so every read lands on an exact frame.
 //
 // Token budget: every tool definition is resent with each request, so they are
@@ -30,6 +31,7 @@ import { EmuHarness } from './driver.mjs';
 import { assertGolden, compare } from './assert.mjs';
 import { scalePng, contactSheet } from './png.mjs';
 import { saveVideo } from './recording.mjs';
+import { convertSprite, writeSpriteSource, injectSprite, overlayFrame, framePng, spriteLimitWarnings } from './sprite.mjs';
 import { RamSearch, SEARCH_OPS, SEARCH_TYPES } from './ramsearch.mjs';
 import { runSteps, parseAddress, decodeValues, encodeValue, VALUE_TYPES } from './steps.mjs';
 import { gbaSprites, gbSprites, drawBoxes, gbaPalettes, gbPalettes, palettesPng, gbaTilesPng, gbTilesPng } from './video.mjs';
@@ -41,21 +43,23 @@ const VERSION = JSON.parse(readFileSync(path.join(__dirname, 'package.json'), 'u
 const BUTTONS = ['A', 'B', 'L', 'R', 'START', 'SELECT', 'UP', 'DOWN', 'LEFT', 'RIGHT'];
 const Button = z.enum(BUTTONS);
 const Address = z.union([z.number().int().nonnegative(), z.string()]).describe('number or hex string "0x0300..."');
-const Scale = z.number().int().min(1).max(4).default(2).describe('image upscale');
+const Scale = z.number().int().min(1).max(4).default(2);
 
 /** Tools in the "core" set: enough to play, look, check and script a game. */
 export const CORE_TOOLS = ['load_rom', 'wait_frames', 'press', 'set_button', 'wait_until', 'screenshot',
   'read_memory', 'write_memory', 'run_sequence', 'assert_golden', 'status'];
 
-/** Drop JSON-schema noise that costs tokens but tells a model nothing: the
- *  $schema URL and the ±2^53 bounds zod puts on every integer. */
+/** Drop JSON-schema detail that costs tokens on every request but rarely helps
+ *  a model: the $schema URL, numeric bounds, and "type" next to an enum. Inputs
+ *  are still fully validated by the zod schemas on the server, whose error
+ *  messages state the limits. */
 function slimSchema(node) {
   if (Array.isArray(node)) return node.map(slimSchema);
   if (!node || typeof node !== 'object') return node;
   const out = {};
   for (const [k, v] of Object.entries(node)) {
-    if (k === '$schema') continue;
-    if ((k === 'minimum' || k === 'maximum') && Math.abs(v) === Number.MAX_SAFE_INTEGER) continue;
+    if (k === '$schema' || k === 'minimum' || k === 'maximum' || k === 'exclusiveMinimum' || k === 'exclusiveMaximum') continue;
+    if (k === 'type' && node.enum) continue;
     out[k] = slimSchema(v);
   }
   return out;
@@ -226,7 +230,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
   });
 
   tool('wait_until', {
-    description: 'Run until a RAM condition (address+op+value) or a screen condition ("changed", or "stable" for `frames` frames) holds; stops on the first such frame. Use instead of wait/read loops. precise=true checks every frame at 1x.',
+    description: 'Run until address op value, or screen changed / stable for `frames`, holds; stops on that first frame. Use instead of wait/read loops.',
     inputSchema: {
       address: Address.optional(),
       as: z.enum(Object.keys(VALUE_TYPES)).default('u8'),
@@ -331,7 +335,8 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
       return `#${s.index} ${s.x},${s.y} ${s.w}x${s.h} t${s.tile} p${s.palette}${f ? ' ' + f : ''}`;
     };
     const extra = overlay ? [png(drawBoxes(await emu.screenshot(), visible, scale))] : [];
-    return result(`${visible.length}/${list.length} on screen, frame ${await emu.frameNum()}.${shown.length ? '\n' + shown.map(line).join('\n') : ''}`,
+    const warn = spriteLimitWarnings(emu.system, list, r);
+    return result(`${visible.length}/${list.length} on screen, frame ${await emu.frameNum()}.${warn.length ? '\nLIMIT: ' + warn.join('; ') : ''}${shown.length ? '\n' + shown.map(line).join('\n') : ''}`,
       { onScreen: visible.length }, extra);
   });
 
@@ -455,14 +460,14 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
 
   // ---- Test ----
   tool('run_sequence', {
-    description: `Run many steps in ONE call (cheaper than separate calls). Steps: {"wait":N} {"tap":"A"|["A","B"],"hold":4,"release":4} {"press"|"release":btn} {"hold":btn,"frames":N} {"waitUntil":{"address","op","value"}|{"screen":"changed"|"stable"},"maxFrames":N} {"shot":name} {"record":{"frames","every"}} {"saveState"|"loadState":id} {"loadStateFile":path} {"read":addr,"as"} {"write":addr,"value"|"hex"} {"assertRam":addr,"as","equals"|"min"|"max"} {"assert":png,"threshold","ignore"} {"reset":true} {"cheats":[..]} {"importSave":path}`,
+    description: 'Run many steps in one call (cheaper than separate calls). Steps, one key each: wait:N | tap:btn or [btns] (hold,release) | press/release:btn | hold:btn,frames | waitUntil:{address,op,value} or {screen:changed|stable} (maxFrames) | shot:name | record:{frames,every} | saveState/loadState:id | loadStateFile:path | read:addr (as) | write:addr,value|hex | assertRam:addr,equals|min|max | assert:png (threshold,ignore,sprite) | video:{frames,path} | reset:true | cheats:[..] | importSave:path',
     inputSchema: {
       steps: z.array(z.record(z.string(), z.any())).min(1),
       scale: Scale,
       outDir: z.string().optional().describe('also save shots + timeline.json'),
       maxImages: z.number().int().min(0).max(20).default(8),
       video: z.object({ path: z.string(), onlyOnFail: z.boolean().default(true), seconds: z.number().positive().default(10) }).optional()
-        .describe('record the run (at 1x); by default only kept when a step fails'),
+        .describe('record the run; kept on failure'),
     },
   }, async ({ steps, scale, outDir, maxImages, video }) => {
     const out = outDir ? await writePath(outDir) : undefined;
@@ -510,13 +515,13 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
   });
 
   tool('record_video', {
-    description: 'Play the next `frames` frames and save them as a video (.gif, .png animated, .webm, .mp4, or .wav for sound only). Frame-exact, with sound in .mp4/.webm when a full ffmpeg is installed. For people; to look yourself use run_sequence record.',
+    description: 'Play `frames` frames into a video for people: .gif .png(animated) .webm .mp4 (with sound if ffmpeg allows) or .wav.',
     inputSchema: {
       frames: z.number().int().positive().max(36000),
       path: z.string(),
       every: z.number().int().positive().default(1).describe('keep every Nth frame'),
       scale: z.number().int().min(1).max(4).default(2),
-      audio: z.enum(['auto', 'on', 'off']).default('auto').describe('on: write a .wav beside formats without sound'),
+      audio: z.enum(['auto', 'on', 'off']).default('auto'),
     },
   }, async ({ frames, path: p, every, scale, audio }) => {
     const file = await writePath(p);
@@ -534,13 +539,14 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
       threshold: z.number().min(0).max(1).default(0.02).describe('max fraction of differing pixels'),
       tolerance: z.number().int().min(0).max(255).default(16),
       ignore: z.array(Rect).default([]),
+      sprite: z.number().int().min(0).optional().describe('compare this sprite\'s graphics instead of the screen'),
       scale: Scale,
     },
-  }, async ({ golden, threshold, tolerance, ignore, scale }) => {
-    const shot = await emu.screenshot();
+  }, async ({ golden, threshold, tolerance, ignore, sprite, scale }) => {
+    const shot = sprite !== undefined ? await emu.spriteImage(sprite) : await emu.screenshot();
     const goldenPath = await writePath(golden);
     const res = await assertGolden(shot, goldenPath, { threshold, tolerance, ignore });
-    record({ assert: goldenPath, threshold, tolerance, ...(ignore.length ? { ignore } : {}) });
+    record({ assert: goldenPath, threshold, tolerance, ...(ignore.length ? { ignore } : {}), ...(sprite !== undefined ? { sprite } : {}) });
     const out = { pass: res.pass, created: !!res.created, fraction: res.fraction ?? 0 };
     if (res.created) return result(`Golden created: ${res.goldenPath}. Check it:`, out, [png(scalePng(shot, scale))]);
     const pct = (res.fraction * 100).toFixed(2);
@@ -624,7 +630,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
 
   // ---- Find ----
   tool('ram_search', {
-    description: 'Find where a value lives (HP, score…). "start" snapshots RAM (type, region, optional known value). "filter" narrows using the current frame: op eq/ne/gt/lt/gte/lte vs value; changed/unchanged/increased/decreased vs the last snapshot; delta = changed by value. "list" shows candidates. Change the value in game between filters.',
+    description: 'Find where a value (HP, score) lives: start (optional known value), change it in game, filter (op vs value, or changed/unchanged/increased/decreased/delta vs last) until one is left; list shows candidates.',
     inputSchema: {
       action: z.enum(['start', 'filter', 'list']),
       type: z.enum(SEARCH_TYPES).default('u8'),
@@ -654,6 +660,62 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     const more = search.count > rows.length ? `\n…${search.count - rows.length} more` : '';
     return result(`${head} ${search.count} (${search.type}).${lines.length ? `\n${lines.join('\n')}${more}` : ''}`, { count: search.count });
   });
+
+  // ---- Make: sprites ----
+  tool('sprite', {
+    description: 'Sprite art. convert: PNG (sheet of width x height frames) to tiles+palette; out=.h/.c/.s/.asm/.bin, animation=.gif. inject: frame into the game at x,y (oam). overlay: draw on screen only. export: sprite index from VRAM.',
+    inputSchema: {
+      action: z.enum(['convert', 'inject', 'overlay', 'export']),
+      png: z.string().optional(),
+      target: z.enum(['gba4', 'gba8', 'gbc', 'gb']).optional(),
+      width: z.number().int().positive().optional(), height: z.number().int().positive().optional(),
+      transparent: z.string().optional().describe('alpha|none|#rrggbb'),
+      quantize: z.boolean().default(false),
+      out: z.string().optional(), name: z.string().optional(),
+      animation: z.string().optional(), fps: z.number().positive().default(10),
+      frame: z.number().int().min(0).default(0), x: z.number().int().default(0), y: z.number().int().default(0),
+      tile: z.number().int().min(0).optional(), palette: z.number().int().min(0).default(0), oam: z.number().int().min(0).default(0),
+      index: z.number().int().min(0).optional(), path: z.string().optional(),
+      scale: Scale,
+    },
+  }, async (a) => {
+    if (a.action === 'export') {
+      requireRom();
+      if (a.index === undefined) return errText('export needs `index`');
+      const img = await emu.spriteImage(a.index);
+      let file;
+      if (a.path) { file = await writePath(a.path); await mkdir(path.dirname(file), { recursive: true }); await writeFile(file, img); }
+      return result(`Sprite ${a.index}${file ? ` saved to ${file}` : ''}.`, undefined, [png(scalePng(img, a.scale))]);
+    }
+    if (!a.png) return errText(`${a.action} needs \`png\``);
+    const target = a.target ?? (emu ? (emu.system === 'gba' ? 'gba4' : ((await emu.readRegions()).isCgbWram ? 'gbc' : 'gb')) : null);
+    if (!target) return errText('give `target` (no ROM loaded)');
+    const conv = convertSprite(await readFile(await resolvePath(a.png)), { target, width: a.width, height: a.height, transparent: a.transparent, quantize: a.quantize });
+    const info = `${conv.frames} frame(s) ${conv.width}x${conv.height}, ${conv.palette.length} colour(s), ${conv.tilesPerFrame} tile(s)/frame, ${target}.${conv.warnings.length ? ' WARN: ' + conv.warnings.join('; ') : ''}`;
+    if (a.action === 'convert') {
+      const files = [];
+      if (a.out) files.push(...(await writeSpriteSource(conv, await writePath(a.out), a.name ?? path.basename(a.png).replace(/\.[^.]+$/, ''))));
+      if (a.animation) {
+        const caps = conv.indices.map((idx, i) => ({ frame: Math.round(i * 60 / a.fps), png: framePng(conv, idx) }));
+        caps.push({ ...caps[caps.length - 1], frame: Math.round(conv.frames * 60 / a.fps) });
+        files.push((await saveVideo(caps, await writePath(a.animation), { scale: a.scale, audio: 'off' })).file);
+      }
+      return result(`${info}${files.length ? ` Wrote ${files.join(', ')}.` : ''}`, { frames: conv.frames }, [png(scalePng(conv.previewPng, a.scale))]);
+    }
+    requireRom();
+    if (a.action === 'overlay') {
+      return result(info, undefined, [png(scalePng(overlayFrame(await emu.screenshot(), conv, a.frame, a.x, a.y), a.scale))]);
+    }
+    const r = await injectSprite(emu, conv, { frame: a.frame, x: a.x, y: a.y, tile: a.tile, palette: a.palette, oam: a.oam });
+    await emu.waitFrames(1); // let the core draw it
+    record({ wait: 1 });
+    const now = (await emu.sprites())[a.oam];
+    const kept = now && now.x === a.x && now.y === a.y && now.tile === r.tile;
+    const head = kept
+      ? `Injected at ${a.x},${a.y}: tiles from ${r.tile}, ${r.oamEntries} OAM entr${r.oamEntries === 1 ? 'y' : 'ies'} from ${a.oam}.`
+      : `Injected, but the game rewrote OAM entry ${a.oam} on the next frame (it copies its own sprite table each frame) — use action "overlay" to preview instead.`;
+    return result(`${head} ${info}${r.notes.length ? ' ' + r.notes.join('; ') : ''}`, { tile: r.tile, kept }, [png(scalePng(await emu.screenshot(), a.scale))]);
+  }, { needsRom: false });
 
   // ---- Status ----
   const statusData = async () => (emu

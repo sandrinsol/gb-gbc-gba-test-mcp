@@ -14,6 +14,7 @@
 //   { "assertRam": "0x03000010", "as": "u16", "equals": 3, "name": "hp" }
 //   { "assert": "goldens/title.png", "threshold": 0.02, "name": "title",
 //     "ignore": [{ "x": 200, "y": 0, "w": 40, "h": 16 }] }
+//   { "assert": "goldens/hero.png", "sprite": 0 }    one sprite's graphics only
 //   { "waitUntil": { "address": "0xC000", "op": "eq", "value": 3 }, "maxFrames": 600 }
 //   { "waitUntil": { "screen": "stable", "frames": 30 } }
 //   { "reset": true }                               reset button (battery save kept)
@@ -226,8 +227,9 @@ async function runPlain(emu, steps, { outDir, baseDir = process.cwd(), states = 
     } else if ('assert' in step) {
       const name = step.name || path.basename(step.assert).replace(/\.png$/i, '');
       entry.action = `assert ${name}`;
-      const s = await snap(name);
-      if (s.file) entry.file = s.file;
+      let s;
+      if (step.sprite !== undefined) s = { png: await emu.spriteImage(step.sprite) };
+      else { s = await snap(name); if (s.file) entry.file = s.file; }
       const golden = path.resolve(baseDir, step.assert);
       checkWrite(golden);
       const res = await assertGolden(s.png, golden, {
