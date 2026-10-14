@@ -5,7 +5,7 @@
 //                 (it only reads JPEG, so frames go through `toJpeg`)
 //   .mp4          H.264 via an ffmpeg with libx264 on PATH (or GBTEST_FFMPEG)
 //   .wav          the audio alone
-// Audio (captured deterministically with the frames) is muxed into .mp4/.webm
+// Audio (captured in step with the frames) is muxed into .mp4/.webm
 // when a full ffmpeg is available; Playwright's has no audio encoders.
 // Frames are upscaled with nearest-neighbour so pixels stay sharp.
 

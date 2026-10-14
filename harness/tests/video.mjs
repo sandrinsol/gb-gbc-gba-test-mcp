@@ -156,7 +156,9 @@ if (findFfmpeg()) {
 } else console.log('SKIP: WebM (no ffmpeg)');
 await emu.close();
 
-// ---- Audio is deterministic (and fast-forward doesn't change it) ----
+// ---- Audio: identical across runs unless something rewound the machine ----
+// (A rewind — screenshot, state load, RAM write, fast-forward recovery under load —
+// runs one frame of the abandoned timeline into the audio resampler; see page.html.)
 const audioRun = async (fast) => {
   const e = await EmuHarness.launch('../anguna.gba', { reuse: true, fast });
   await e.waitFrames(300);
@@ -164,12 +166,14 @@ const audioRun = async (fast) => {
   await e.startRecording({ every: 60, maxFrames: 100 });
   await e.waitFrames(400);
   const r = await e.stopRecording();
+  const { rewinds } = await e.stats();
   await e.close();
-  return /** @type {any} */ (r).audio.pcm;
+  return { pcm: /** @type {any} */ (r).audio.pcm, rewinds };
 };
-const a1 = await audioRun(true), a2 = await audioRun(true), a3 = await audioRun(false);
-ok('audio identical across runs', a1.equals(a2), `${a1.length} vs ${a2.length} bytes`);
-ok('audio identical at 1x', a1.equals(a3));
+const s1 = await audioRun(false), s2 = await audioRun(false), f1 = await audioRun(true);
+ok('audio identical across runs', s1.rewinds === s2.rewinds && s1.pcm.equals(s2.pcm), `${s1.pcm.length} vs ${s2.pcm.length} bytes`);
+if (f1.rewinds === s1.rewinds) ok('fast-forward does not change the audio', f1.pcm.equals(s1.pcm));
+else ok('after a fast-forward recovery the audio keeps its length', Math.abs(f1.pcm.length - s1.pcm.length) <= 4 * 1024, `${f1.rewinds} rewinds`);
 
 // ---- Recording a run that fails ----
 {

@@ -80,7 +80,7 @@
     // bit-identical to a pure 1x run either way. Disable with ?fast=0.
     Emu.fast = params.get('fast') !== '0';
     const FF_RATIO = 8, FF_MARGIN = 60;
-    Emu.stats = { ffWaits: 0, recoveries: 0, restoreRetries: 0 };
+    Emu.stats = { ffWaits: 0, recoveries: 0, restoreRetries: 0, rewinds: 0 };
     Emu._forceOvershoot = false; // test hook: pretend the next fast-forward overshot
     let ffOn = false;
     const setFF = (on) => {
@@ -115,6 +115,7 @@
       setFF(false);
       for (let attempt = 0; attempt < 10; attempt++) {
         gm().loadState(u8);
+        Emu.stats.rewinds++; // this iteration runs one frame of the old timeline
         const c = gm().getFrameNum();
         Emu.resume();
         while (gm().getFrameNum() <= c) await raf();
@@ -138,8 +139,12 @@
     // The core's audio goes out through Emscripten's OpenAL, which creates one
     // AudioBuffer per chunk. Normally the driver drops or repeats chunks depending
     // on the real audio clock (suspended in headless Chrome); driving that clock
-    // from the emulated frame counter instead makes the sample stream identical on
-    // every run, fast-forward included. While recording, chunks are collected.
+    // from the emulated frame counter instead keeps the stream in step with the
+    // frames and identical across runs — as long as nothing rewinds the machine:
+    // every restore (screenshot, state load, RAM write, fast-forward recovery)
+    // runs one frame of the abandoned timeline, whose sound goes into RetroArch's
+    // resampler and can't be taken back (Emu.stats.rewinds counts them). The
+    // picture and RAM are unaffected. While recording, chunks are collected.
     Emu._audio = null; // { chunks: AudioBuffer[] } while recording
     Emu.initAudio = () => {
       const ctx = gm().Module.AL && gm().Module.AL.currentCtx && gm().Module.AL.currentCtx.audioCtx;
