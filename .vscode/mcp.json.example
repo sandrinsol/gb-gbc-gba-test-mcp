@@ -1,9 +1,10 @@
 {
-  "// note": "VS Code MCP config. Copy this to .vscode/mcp.json in your workspace and set the absolute path. VS Code uses the top-level key \"servers\" (Claude Desktop / Cursor / Antigravity use \"mcpServers\").",
+  "// note": "VS Code MCP config. Copy this to .vscode/mcp.json in your workspace and set the absolute path. VS Code uses the top-level key \"servers\" (Claude Desktop / Cursor / Antigravity use \"mcpServers\"). GBTEST_ROOT makes relative ROM/golden paths resolve against your workspace.",
   "servers": {
     "gb-gbc-gba-test": {
       "command": "node",
-      "args": ["/absolute/path/to/gb-gbc-gba-test-mcp/harness/mcp-server.mjs"]
+      "args": ["/absolute/path/to/gb-gbc-gba-test-mcp/harness/mcp-server.mjs"],
+      "env": { "GBTEST_ROOT": "${workspaceFolder}" }
     }
   }
 }

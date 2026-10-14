@@ -1,0 +1,174 @@
+// Step runner shared by runner.mjs (CLI) and the MCP `run_sequence` tool: drive a
+// ROM through plain-JSON steps and collect a timeline + screenshots.
+//
+// Step types (one action key per step):
+//   { "wait": 60 }                                  advance N frames
+//   { "tap": "A" } / { "tap": ["A","B"], "hold": 4, "release": 4 }
+//   { "press": "RIGHT" } / { "release": "RIGHT" }   hold / let go (string or array)
+//   { "hold": "RIGHT", "frames": 30 }               hold for N frames, then release
+//   { "shot": "title" }                             named screenshot
+//   { "record": { "frames": 120, "every": 20, "prefix": "walk" } }
+//   { "saveState": "cp" } / { "loadState": "cp" }   named, in-memory
+//   { "read": "0x03000010", "as": "u16", "name": "hp" }   record a RAM value
+//   { "write": "0x03000010", "value": 1, "as": "u8" }     set-up poke
+//   { "assertRam": "0x03000010", "as": "u16", "equals": 3, "name": "hp" }
+//   { "assert": "goldens/title.png", "threshold": 0.02, "name": "title" }
+
+import path from 'node:path';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { assertGolden } from './assert.mjs';
+
+/** Parse a bus address given as a number or a string ("0x03000010", "$C000",
+ *  "C000h", or decimal digits). JSON has no hex literals, so agents send strings. */
+export function parseAddress(a) {
+  if (typeof a === 'number') {
+    if (!Number.isInteger(a) || a < 0) throw new Error(`invalid address ${a}`);
+    return a;
+  }
+  const s = String(a).trim();
+  let m;
+  if ((m = /^(?:0x|\$)([0-9a-f]+)$/i.exec(s)) || (m = /^([0-9a-f]+)h$/i.exec(s))) return parseInt(m[1], 16);
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  if (/^[0-9a-f]+$/i.test(s)) return parseInt(s, 16); // bare hex with a-f digits
+  throw new Error(`invalid address "${a}" (use e.g. "0x03000010" or a number)`);
+}
+
+export const VALUE_TYPES = { u8: [1, 'readUInt8'], u16: [2, 'readUInt16LE'], u32: [4, 'readUInt32LE'], s8: [1, 'readInt8'], s16: [2, 'readInt16LE'], s32: [4, 'readInt32LE'] };
+
+/** Decode `buf` as consecutive little-endian values of type `as`. */
+export function decodeValues(buf, as) {
+  const [w, fn] = VALUE_TYPES[as];
+  const out = [];
+  for (let o = 0; o + w <= buf.length; o += w) out.push(buf[fn](o));
+  return out;
+}
+
+/** Encode an integer as `as` (u8/u16/u32; signed types share the unsigned layout). */
+export function encodeValue(value, as) {
+  const w = VALUE_TYPES[as][0];
+  const b = Buffer.alloc(w);
+  if (w === 1) b.writeUInt8(value & 0xff);
+  else if (w === 2) b.writeUInt16LE(value & 0xffff);
+  else b.writeUInt32LE(value >>> 0);
+  return b;
+}
+
+const hex = (n) => '0x' + n.toString(16);
+const asList = (b) => (Array.isArray(b) ? b : [b]);
+
+/**
+ * Run `steps` against an EmuHarness.
+ * @param opts.outDir   write screenshots here (optional)
+ * @param opts.baseDir  resolve relative `assert` golden paths against this
+ * @param opts.states   Map of named states (shared with the caller, optional)
+ * @param opts.log      (msg) => void
+ * @returns {{ timeline, shots: [{name, frame, png, file?}], records: [{prefix, frames, pngs}], failures }}
+ */
+export async function runSteps(emu, steps, { outDir, baseDir = process.cwd(), states = new Map(), log = () => {} } = {}) {
+  if (!Array.isArray(steps)) throw new Error('steps must be an array');
+  if (outDir) await mkdir(outDir, { recursive: true });
+  const timeline = [], shots = [], records = [];
+  let seq = 0, failures = 0;
+
+  const snap = async (name) => {
+    const png = await emu.screenshot();
+    const frame = await emu.frameNum();
+    const shot = { name, frame, png };
+    if (outDir) {
+      shot.file = `${String(seq++).padStart(3, '0')}-${name}.png`;
+      await writeFile(path.join(outDir, shot.file), png);
+    }
+    return shot;
+  };
+
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const entry = { i, frame: await emu.frameNum() };
+    if ('wait' in step) {
+      entry.action = `wait ${step.wait}`;
+      await emu.waitFrames(step.wait);
+    } else if ('tap' in step) {
+      entry.action = `tap ${asList(step.tap).join('+')}`;
+      await emu.tap(step.tap, step.hold ?? 4, step.release ?? 4);
+    } else if ('press' in step) {
+      entry.action = `press ${asList(step.press).join('+')}`;
+      await emu.setButtons(asList(step.press), true);
+    } else if ('release' in step) {
+      entry.action = `release ${asList(step.release).join('+')}`;
+      await emu.setButtons(asList(step.release), false);
+    } else if ('hold' in step) {
+      const frames = step.frames ?? 30;
+      entry.action = `hold ${asList(step.hold).join('+')} ${frames}f`;
+      await emu.setButtons(asList(step.hold), true);
+      await emu.waitFrames(frames);
+      await emu.setButtons(asList(step.hold), false);
+    } else if ('shot' in step) {
+      entry.action = `shot ${step.shot}`;
+      const s = await snap(step.shot);
+      shots.push(s);
+      if (s.file) entry.file = s.file;
+    } else if ('record' in step) {
+      const { frames = 300, every = 30, prefix = 'frame' } = step.record;
+      entry.action = `record ${frames}f/${every}`;
+      const rec = { prefix, frames: [], pngs: [], files: [] };
+      for (let f = 0; f < frames; f += every) {
+        await emu.waitFrames(every);
+        const s = await snap(`${prefix}-${await emu.frameNum()}`);
+        rec.frames.push(s.frame); rec.pngs.push(s.png);
+        if (s.file) rec.files.push(s.file);
+      }
+      records.push(rec);
+      entry.frames = rec.frames;
+      if (outDir) entry.files = rec.files;
+    } else if ('saveState' in step) {
+      entry.action = `saveState ${step.saveState}`;
+      states.set(step.saveState, await emu.saveState());
+    } else if ('loadState' in step) {
+      entry.action = `loadState ${step.loadState}`;
+      const st = states.get(step.loadState);
+      if (!st) throw new Error(`step ${i}: no saved state named "${step.loadState}"`);
+      await emu.loadState(st);
+    } else if ('read' in step) {
+      const addr = parseAddress(step.read), as = step.as ?? 'u8';
+      if (!VALUE_TYPES[as]) throw new Error(`step ${i}: bad "as" ${as}`);
+      const count = step.count ?? 1;
+      const vals = decodeValues(await emu.readMemory(addr, VALUE_TYPES[as][0] * count), as);
+      entry.action = `read ${step.name ?? hex(addr)}`;
+      entry.value = count === 1 ? vals[0] : vals;
+    } else if ('write' in step) {
+      const addr = parseAddress(step.write);
+      const bytes = step.hex != null ? Buffer.from(String(step.hex).replace(/[^0-9a-f]/gi, ''), 'hex') : encodeValue(step.value, step.as ?? 'u8');
+      entry.action = `write ${hex(addr)}`;
+      entry.stuck = await emu.writeMemory(addr, bytes);
+    } else if ('assertRam' in step) {
+      const addr = parseAddress(step.assertRam), as = step.as ?? 'u8';
+      const [val] = decodeValues(await emu.readMemory(addr, VALUE_TYPES[as][0]), as);
+      const name = step.name ?? hex(addr);
+      const pass = 'equals' in step ? val === step.equals
+        : ('min' in step || 'max' in step) ? val >= (step.min ?? -Infinity) && val <= (step.max ?? Infinity)
+          : true;
+      entry.action = `assertRam ${name}`;
+      entry.assert = { value: val, pass, ...('equals' in step ? { equals: step.equals } : {}), ...('min' in step ? { min: step.min } : {}), ...('max' in step ? { max: step.max } : {}) };
+      if (!pass) { failures++; log(`  ✗ assertRam ${name}: ${val}`); } else log(`  ✓ assertRam ${name} = ${val}`);
+    } else if ('assert' in step) {
+      const name = step.name || path.basename(step.assert).replace(/\.png$/i, '');
+      entry.action = `assert ${name}`;
+      const s = await snap(name);
+      if (s.file) entry.file = s.file;
+      const res = await assertGolden(s.png, path.resolve(baseDir, step.assert), {
+        threshold: step.threshold ?? 0.02, tolerance: step.tolerance ?? 16,
+      });
+      entry.assert = {
+        golden: res.goldenPath, created: res.created, pass: res.pass,
+        fraction: Number((res.fraction ?? 0).toFixed(4)),
+        ...(res.diffPath ? { diff: res.diffPath } : {}),
+      };
+      if (!res.pass) { failures++; log(`  ✗ assert ${name}: ${(res.fraction * 100).toFixed(2)}% differ (> ${(step.threshold ?? 0.02) * 100}%)`); }
+      else log(`  ✓ assert ${name}${res.created ? ' (golden created)' : ''}`);
+    } else {
+      throw new Error(`step ${i}: unknown step ${JSON.stringify(step)}`);
+    }
+    timeline.push(entry);
+  }
+  return { timeline, shots, records, failures };
+}

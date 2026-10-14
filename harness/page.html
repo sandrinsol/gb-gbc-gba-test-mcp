@@ -116,7 +116,7 @@
         Emu.resume();
         while (gm().getFrameNum() <= c) await raf();
         Emu.pause();
-        if (sameState(gm().getState(), u8)) { Emu._offset = gm().getFrameNum() - frame; return; }
+        if (sameState(gm().getState(), u8)) { Emu._offset = gm().getFrameNum() - frame; Emu._fbValid = false; return; }
         Emu.stats.restoreRetries++;
       }
       throw new Error('could not restore the save state exactly');
@@ -149,7 +149,7 @@
           f = Emu.frameNum();
         }
         if (ffOn && targetFrame - f <= FF_MARGIN) setFF(false);
-        if (f >= targetFrame && !ffOn) { Emu.pause(); return f; }
+        if (f >= targetFrame && !ffOn) { Emu.pause(); Emu._advanced(); return f; }
         if (performance.now() - t0 > timeoutMs) {
           setFF(false);
           Emu.pause();
@@ -190,25 +190,77 @@
       return u8;
     };
 
+    // ---- Screen tracking ----
+    // A save state doesn't contain the rendered picture, and every restore runs one
+    // main-loop iteration of the OLD timeline, so after a restore the core's
+    // framebuffer is stale. We therefore track the screen explicitly:
+    //  - _fbValid: the framebuffer shows the current frame (true right after a wait)
+    //  - _screen:  cached PNG of the current frame (survives restores that don't
+    //              change what's on screen, e.g. RAM pokes)
+    //  - shotByState: PNGs of states handed out by saveState(), so loading one of
+    //              them restores its picture too.
+    Emu._fbValid = true;
+    Emu._screen = null;
+    const shotByState = new Map(); // hash -> png b64 (bounded)
+    const hashState = (u8) => {
+      let h = 0x811c9dc5;
+      for (let i = 0; i < u8.length; i++) h = Math.imul(h ^ u8[i], 16777619);
+      return (h >>> 0).toString(16) + ':' + u8.length;
+    };
+    Emu._advanced = () => { Emu._fbValid = true; Emu._screen = null; };
+
     // The core only renders a screenshot from inside its main loop, so while paused
     // we run it just long enough to capture, then restore the exact pre-capture state.
-    Emu.screenshot = async () => {
-      if (Emu._running) return u8ToB64(await gm().screenshot());
+    async function captureScreen() {
       const snap = gm().getState(), f = Emu.frameNum();
       Emu.resume();
       try { return u8ToB64(await gm().screenshot()); } // PNG -> base64
       finally { Emu.pause(); await restore(snap, f); }
+    }
+    /** -> { png: base64, stale: bool }. stale = the picture for this exact state is
+     *  unknown (e.g. right after loading an external save state) and the image is the
+     *  last frame the core rendered; advance >= 1 frame for a true picture. */
+    Emu.screenshot = async () => {
+      if (Emu._running) return { png: u8ToB64(await gm().screenshot()), stale: false };
+      if (Emu._screen) return { png: Emu._screen, stale: false };
+      const stale = !Emu._fbValid;
+      const png = await captureScreen();
+      if (!stale) Emu._screen = png;
+      return { png, stale };
     };
-    Emu.saveState = async () => u8ToB64(await gm().getState());     // savestate -> base64
+    const ensureScreen = async () => { if (!Emu._screen && Emu._fbValid) Emu._screen = await captureScreen(); };
+
+    // Raw machine state (for RAM reads; no screen bookkeeping).
+    Emu.rawState = async () => u8ToB64(await gm().getState());
+    // Public save state: also remembers the picture so loading it restores the screen.
+    Emu.saveState = async () => {
+      await ensureScreen();
+      const u8 = gm().getState();
+      if (Emu._screen) {
+        if (shotByState.size >= 64) shotByState.delete(shotByState.keys().next().value);
+        shotByState.set(hashState(u8), Emu._screen);
+      }
+      return u8ToB64(u8);
+    };
     // The logical clock keeps counting from where it is (a state doesn't carry the
     // frontend's frame counter); re-anchor the deterministic target so later
     // waitFrames() calls stay correct.
     Emu.loadState = async (b64) => {
       Emu.pause();
-      await restore(b64ToU8(b64), Emu.frameNum());
+      const u8 = b64ToU8(b64);
+      await restore(u8, Emu.frameNum());
       Emu._target = Emu.frameNum();
+      Emu._fbValid = false;
+      Emu._screen = shotByState.get(hashState(u8)) || null;
     };
-    Emu.restart = () => gm().restart();
+    // Load a patched copy of the CURRENT state (RAM poke): what's on screen is unchanged.
+    Emu.pokeState = async (b64) => {
+      Emu.pause();
+      await ensureScreen();
+      await restore(b64ToU8(b64), Emu.frameNum());
+      Emu._fbValid = false;
+    };
+    Emu.restart = () => { gm().restart(); Emu._fbValid = false; Emu._screen = null; };
 
     // Live system RAM, IF the loaded core exports the libretro memory API.
     // The bundled mgba core does NOT (returns null); a core rebuilt with

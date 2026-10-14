@@ -176,9 +176,14 @@ export class EmuHarness {
   stats() { return this.page.evaluate(() => window.Emu.stats); }
   restart() { return this.page.evaluate(() => window.Emu.restart()); }
 
+  /** PNG of the current frame → Buffer (and written to `outPath` if given).
+   *  `this.lastScreenshotStale` is true when the picture for this exact state is
+   *  unknown (right after loading a save state this session didn't create) — the
+   *  image is then the last frame rendered; advance a frame for the true picture. */
   async screenshot(outPath) {
-    const b64 = await this.page.evaluate(() => window.Emu.screenshot());
-    const buf = Buffer.from(b64, 'base64');
+    const { png, stale } = await this.page.evaluate(() => window.Emu.screenshot());
+    this.lastScreenshotStale = stale;
+    const buf = Buffer.from(png, 'base64');
     if (outPath) {
       const abs = path.resolve(process.cwd(), outPath);
       await mkdir(path.dirname(abs), { recursive: true }); // out/ is gitignored; ensure it exists
@@ -190,6 +195,9 @@ export class EmuHarness {
   async saveState() {
     const b64 = await this.page.evaluate(() => window.Emu.saveState());
     return Buffer.from(b64, 'base64');
+  }
+  async _rawState() {
+    return Buffer.from(await this.page.evaluate(() => window.Emu.rawState()), 'base64');
   }
   async loadState(buf) {
     const b64 = Buffer.from(buf).toString('base64');
@@ -208,32 +216,26 @@ export class EmuHarness {
 
   /** Parse a fresh save state into typed RAM regions.
    *  GBA: { ewram, iwram, vram, pram, oam, io }. GB/GBC: { wram, vram, sram, hram, io }. */
-  async readRegions() { return this._mem.parseState(await this.saveState()); }
+  async readRegions() { return this._mem.parseState(await this._rawState()); }
 
   /** Read `length` bytes at a bus address. GBA e.g. 0x03000000 (IWRAM); GB/GBC e.g.
    *  0xC000 (WRAM), 0xFF80 (HRAM). Snapshots a save state, so it reflects the current
    *  frame. Addresses are interpreted for whichever console the loaded ROM is. */
-  async readMemory(addr, length = 1) { return this._mem.readMemory(await this.saveState(), addr, length); }
+  async readMemory(addr, length = 1) { return this._mem.readMemory(await this._rawState(), addr, length); }
   async readU8(addr) { return (await this.readMemory(addr, 1)).readUInt8(0); }
   async readU16(addr) { return (await this.readMemory(addr, 2)).readUInt16LE(0); }
   async readU32(addr) { return (await this.readMemory(addr, 4)).readUInt32LE(0); }
 
-  /** Write bytes at a bus address by patching a save state and reloading it.
-   *  NOTE: this reloads the whole machine state — use it to *set up* state (e.g. HP=1)
-   *  between actions, not as a live mid-frame poke. Reflected on the next read/frame. */
+  /** Write bytes at a bus address on the current frame (patches a save state of
+   *  the paused machine and reloads it; what's on screen is unchanged). Returns
+   *  whether the bytes read back as written — false if the address isn't RAM-backed
+   *  in the state. The game may still overwrite the value on the next frame. */
   async writeMemory(addr, data) {
     const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
-    const state = await this.saveState();
+    const state = await this._rawState();
     this._mem.writeMemory(state, addr, bytes);
-    await this.loadState(state);
-    // Confirm the patch took (loadState applies asynchronously). Poll a read-back in
-    // real time; return as soon as it matches. Volatile locations the running game
-    // overwrites may never match — that's inherent, so give up after a bounded wait.
-    for (let i = 0; i < 30; i++) {
-      if ((await this.readMemory(addr, bytes.length)).equals(bytes)) return true;
-      await new Promise((r) => setTimeout(r, 16));
-    }
-    return false;
+    await this.page.evaluate((b) => window.Emu.pokeState(b), state.toString('base64'));
+    return (await this.readMemory(addr, bytes.length)).equals(bytes);
   }
   async writeU8(addr, v) { await this.writeMemory(addr, Buffer.from([v & 0xff])); }
   async writeU16(addr, v) { const b = Buffer.alloc(2); b.writeUInt16LE(v & 0xffff); await this.writeMemory(addr, b); }
