@@ -1,11 +1,13 @@
-# Push a version tag (git tag v1.4.0 && git push origin v1.4.0) to publish a
-# GitHub release. The tag must match the version in package.json; the notes
+# Publishes a GitHub release for the version in package.json: push its tag
+# (git tag v1.4.0 && git push origin v1.4.0), or run this workflow by hand
+# ("Run workflow"), which creates the tag on the commit it runs on. The notes
 # come from .github/release-notes/<tag>.md, else from the merged PRs.
 name: release
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,18 +18,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check the tag matches the package version
+      - name: Work out the tag
+        id: tag
         run: |
           want="v$(node -p "require('./package.json').version")"
-          [ "$GITHUB_REF_NAME" = "$want" ] || { echo "tag $GITHUB_REF_NAME != package.json $want"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "$want" ]; then
+            echo "tag $GITHUB_REF_NAME != package.json $want"; exit 1
+          fi
+          echo "tag=$want" >> "$GITHUB_OUTPUT"
 
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          notes=".github/release-notes/$GITHUB_REF_NAME.md"
-          if [ -f "$notes" ]; then
-            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$notes" --verify-tag
-          else
-            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
-          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then echo "$TAG is already released"; exit 1; fi
+          notes=".github/release-notes/$TAG.md"
+          args=(--title "$TAG" --target "$GITHUB_SHA")
+          if [ -f "$notes" ]; then args+=(--notes-file "$notes"); else args+=(--generate-notes); fi
+          gh release create "$TAG" "${args[@]}"
