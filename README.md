@@ -9,7 +9,7 @@ agent test them through an MCP server. Everything runs offline from the bundled
   In Claude Code: `/plugin install gb-gbc-gba-test --marketplace sandrinsol/gb-gbc-gba-test-mcp`.
   The agent can build your game, read its variables by name and its screen as text,
   check it against hardware rules, convert art, and start new games from
-  [templates](templates/) for RGBDS, GBDK-2020 and GBA C.
+  [templates](templates/) for RGBDS, GBDK-2020, GBA C, libtonc and Butano.
 
 ## Play
 

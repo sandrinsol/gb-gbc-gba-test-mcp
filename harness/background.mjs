@@ -9,6 +9,8 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { inflateSync, gunzipSync } from 'node:zlib';
 import { decodePng, encodePng } from './png.mjs';
+import { lz77Compress } from './lz77.mjs';
+import { encodeIndexedBmp } from './bmp.mjs';
 
 export const BG_TARGETS = {
   gb: { bpp: 2, palettes: 1, colors: 4, maxTiles: 256, flips: false },
@@ -204,26 +206,56 @@ const hexList = (arr, digits, perLine, prefix = '0x') => {
   return lines.join(',\n');
 };
 
-/** Write a conversion as source for the toolchain: .c (+ .h), .h, .s, .asm/.inc
- *  or .bin (several files). Returns the files written. */
-export async function writeBackgroundSource(conv, file, name) {
+/** The picture as palette indices (GBA 4bpp: bank × 16 + colour; 0 = backdrop). */
+function indexImage(conv) {
+  const { cols, rows, tiles, map } = conv, W = cols * 8, bpp = BG_TARGETS[conv.target].bpp;
+  const out = new Uint8Array(W * rows * 8);
+  for (let i = 0; i < cols * rows; i++) {
+    const e = map[i], tile = e & 0x3ff, h = (e >> 10) & 1, v = (e >> 11) & 1, bank = conv.target === 'gba4' ? e >> 12 : 0;
+    for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
+      const sx = h ? 7 - x : x, sy = v ? 7 - y : y;
+      const c = bpp === 4 ? (tiles[tile * 32 + sy * 4 + (sx >> 1)] >> ((sx & 1) * 4)) & 15 : tiles[tile * 64 + sy * 8 + sx];
+      out[((i / cols | 0) * 8 + y) * W + (i % cols) * 8 + x] = c && bpp === 4 ? bank * 16 + c : c;
+    }
+  }
+  return out;
+}
+
+/** Write a conversion as source for the toolchain: .c (+ .h), .h, .s, .asm/.inc,
+ *  .bin (several files), or (GBA) .bmp + .json for Butano. compress: "lz77"
+ *  (GBA) stores tiles and map in the BIOS LZ77 format. Returns the files written. */
+export async function writeBackgroundSource(conv, file, name, { compress = 'none' } = {}) {
   const id = name.replace(/\W/g, '_'), ID = id.toUpperCase();
   const ext = path.extname(file).toLowerCase();
   await mkdir(path.dirname(path.resolve(file)), { recursive: true });
   const gba = conv.target.startsWith('gba');
+  if (compress === 'lz77' && !gba) throw new Error('LZ77 compression is for GBA targets (the GBA BIOS decompresses it)');
   const pal = conv.palettes.flat();
-  const info = `${conv.cols}x${conv.rows} tile map, ${conv.tileCount} tiles, ${conv.palettes.length || 1} palette(s), ${conv.target}`;
+  if (ext === '.bmp') {
+    if (!gba) throw new Error('.bmp output is for GBA (Butano/grit)');
+    const bpp8 = conv.target === 'gba8';
+    await writeFile(file, encodeIndexedBmp({ width: conv.cols * 8, height: conv.rows * 8, pixels: indexImage(conv), palette: pal.map(from555), bpp: 8 }));
+    const json = file.replace(/\.bmp$/i, '.json');
+    await writeFile(json, JSON.stringify({ type: 'regular_bg', bpp_mode: bpp8 ? 'bpp_8' : 'bpp_4', ...(compress === 'lz77' ? { compression: 'lz77' } : {}) }, null, 2) + '\n');
+    return [file, json];
+  }
+  const lz = compress === 'lz77';
+  const mapBytes = Buffer.from(conv.map.buffer, conv.map.byteOffset, conv.map.byteLength);
+  const tileData = lz ? lz77Compress(conv.tiles) : conv.tiles;
+  const mapData = lz ? lz77Compress(mapBytes) : conv.map;
+  const info = `${conv.cols}x${conv.rows} tile map, ${conv.tileCount} tiles, ${conv.palettes.length || 1} palette(s), ${conv.target}${lz ? ', tiles and map LZ77-compressed' : ''}`;
   const defs = [`#define ${ID}_WIDTH ${conv.cols}`, `#define ${ID}_HEIGHT ${conv.rows}`, `#define ${ID}_TILE_COUNT ${conv.tileCount}`, `#define ${ID}_PALETTE_COUNT ${conv.palettes.length}`];
-  const mapType = gba ? 'unsigned short' : 'unsigned char';
+  if (lz) defs.push(`#define ${ID}_LZ77 1 /* BIOS LZ77: LZ77UnCompVram (swi 0x12) */`, `#define ${ID}_TILES_SIZE ${conv.tiles.length}`, `#define ${ID}_MAP_SIZE ${mapBytes.length} /* bytes once decompressed */`);
+  const mapType = gba && !lz ? 'unsigned short' : 'unsigned char';
   const arrays = [
-    [`const unsigned char ${id}_tiles[${conv.tiles.length}]`, hexList(conv.tiles, 2, 16)],
-    [`const ${mapType} ${id}_map[${conv.map.length}]`, hexList(conv.map, gba ? 4 : 2, gba ? 12 : 16)],
+    [`const unsigned char ${id}_tiles[${tileData.length}]`, hexList(tileData, 2, 16)],
+    [`const ${mapType} ${id}_map[${mapData.length}]`, hexList(mapData, mapType === 'unsigned short' ? 4 : 2, mapType === 'unsigned short' ? 12 : 16)],
     ...(conv.attrs ? [[`const unsigned char ${id}_attrs[${conv.attrs.length}]`, hexList(conv.attrs, 2, 16)]] : []),
     ...(pal.length ? [[`const unsigned short ${id}_pal[${pal.length}]`, hexList(pal, 4, 8)]] : []),
   ];
   if (ext === '.bin') {
     const base = file.replace(/\.bin$/i, '');
-    const files = [[`${base}.tiles.bin`, Buffer.from(conv.tiles)], [`${base}.map.bin`, Buffer.from(conv.map.buffer, conv.map.byteOffset, conv.map.byteLength)]];
+    const files = [[`${base}.tiles.bin`, Buffer.from(tileData)], [`${base}.map.bin`, Buffer.from(mapData.buffer, mapData.byteOffset, mapData.byteLength)]];
     if (conv.attrs) files.push([`${base}.attrs.bin`, Buffer.from(conv.attrs)]);
     if (pal.length) { const p = Buffer.alloc(pal.length * 2); pal.forEach((v, i) => p.writeUInt16LE(v, i * 2)); files.push([`${base}.pal.bin`, p]); }
     for (const [f, b] of files) await writeFile(f, b);
@@ -248,7 +280,7 @@ export async function writeBackgroundSource(conv, file, name) {
       for (let i = 0; i < arr.length; i += 8) l.push(`  ${dir} ${Array.from(arr.slice(i, i + 8), (v) => '0x' + v.toString(16).padStart(digits, '0')).join(', ')}`);
       return l;
     };
-    const lines = [`@ ${info}`, '.section .rodata', ...block(`${id}_tiles`, conv.tiles, '.byte', 2), ...block(`${id}_map`, conv.map, gba ? '.hword' : '.byte', gba ? 4 : 2)];
+    const lines = [`@ ${info}`, '.section .rodata', ...block(`${id}_tiles`, tileData, '.byte', 2), ...block(`${id}_map`, mapData, mapType === 'unsigned short' ? '.hword' : '.byte', mapType === 'unsigned short' ? 4 : 2)];
     if (conv.attrs) lines.push(...block(`${id}_attrs`, conv.attrs, '.byte', 2));
     if (pal.length) lines.push(...block(`${id}_pal`, pal, '.hword', 4));
     await writeFile(file, lines.join('\n') + '\n');

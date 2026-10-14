@@ -7,10 +7,12 @@ downloaded at runtime.
 
 - `mcp-server.mjs` — MCP server for agents (Claude Code, Cursor, VS Code, …).
 - `driver.mjs` — the same features as a Node library, for scripts and CI.
-- Starter games for RGBDS, GBDK-2020 and arm-none-eabi-gcc that build, run and pass
-  a test from the start ([`templates/`](../templates/)).
+- Starter games for RGBDS, GBDK-2020, plain arm-none-eabi-gcc, devkitARM + libtonc
+  and Butano that build, run and pass a test from the start
+  ([`templates/`](../templates/)).
 - A Claude Code plugin bundling the server with skills (testing, homebrew
-  development, hardware reference, playtesting, CI) and a `gb-tester` agent
+  development, GBA development, Butano, hardware reference, playtesting, CI) and
+  a `gb-tester` agent
   ([`skills/`](../skills/), [`agents/`](../agents/)).
 
 ## Setup
@@ -58,7 +60,7 @@ VS Code uses the key `"servers"` instead of `"mcpServers"`; see
 | `UPDATE_GOLDENS=1` | Re-create golden images instead of comparing. |
 
 Start a game from a template with the `new_project` tool, or from the clone:
-`node harness/mcp-server.mjs new <gb-asm|gb-c|gba-c> <dir>`.
+`node harness/mcp-server.mjs new <gb-asm|gb-c|gba-c|gba-tonc|gba-butano> <dir>`.
 
 ## Tools
 
@@ -74,7 +76,7 @@ Start a game from a template with the `new_project` tool, or from the clone:
 | `read_memory` | Read RAM; addresses as numbers or hex strings (`"0x03000010"`). |
 | `read_cpu` | CPU registers. |
 | `read_sprites` | On-screen sprites, a screenshot with them outlined, and per-line limit warnings. |
-| `view_vram` | Tiles or palettes as an image. |
+| `view_vram` | Tiles or palettes as an image; on GBA also `layers`: each background and the sprite layer on its own, with the display registers decoded. |
 | `status` | ROM, frame, held buttons, saved states, cheats. |
 | `write_memory` | Write RAM on the current frame. |
 | `save_state` / `load_state` | Named snapshots, optionally to/from a file. |
@@ -86,18 +88,18 @@ Start a game from a template with the `new_project` tool, or from the clone:
 | `export_script` | Everything done since `load_rom` as replayable steps. |
 | `ab_compare` | Run the same steps on two ROMs and report differences. |
 | `ram_search` | Find where a value (HP, score…) is stored: `start`, then `filter` until one address is left. |
-| `sprite` | Sprite art: `convert` a PNG to tiles + palette (source for your toolchain), `inject` it into the running game, `overlay` it on the screen, `export` a sprite from VRAM. |
-| `background` | Background art, fonts or a Tiled map (`.tmx`/`.tmj`) to tiles + tilemap + palettes, with duplicate and mirrored tiles merged; returns a preview rebuilt from the output. |
+| `sprite` | Sprite art: `convert` a PNG to tiles + palette (source for your toolchain, or `.bmp` + `.json` for Butano; GBA `compress: "lz77"`), `inject` it into the running game, `overlay` it on the screen, `export` a sprite from VRAM. |
+| `background` | Background art, fonts or a Tiled map (`.tmx`/`.tmj`) to tiles + tilemap + palettes, with duplicate and mirrored tiles merged (same outputs and compression); returns a preview rebuilt from the output. |
 | `build` | Run the project's build, report compiler errors as `file:line: error: …`, load the new ROM with its symbols, check its header; `replay` returns to where you were. |
-| `describe` | The screen as text: on-screen text, sprites, watched variables, how much changed. |
+| `describe` | The screen as text: on-screen text, sprites, watched variables, how much changed; `io: true` adds the display, interrupt, DMA and timer registers in words. |
 | `watch` | Variables to report after every step that advances time. |
-| `check` | Hardware rules: ROM header, then a short run watching for crashes, a bad stack, sprite overflow, bitmap-mode sprite tiles, a blank screen and lag frames. |
+| `check` | Hardware rules: ROM header and save type, then a short run watching for crashes, a bad stack, sprite overflow, a blank screen and lag frames; on GBA also maps overlapping tile data, 2D sprite mapping with 1D tiles, black palettes, all-zero affine matrices, bitmap-mode sprite tiles and save data without a save-type string. |
 | `new_project` | Copy a starter template. |
 
 Prompts: `smoke_test_rom`, `regression_check`, `find_ram_address`,
 `record_regression_test`. Resources: `emu://screen`, `emu://status`.
 
-**Token use.** Tool definitions are sent with every request: ~3,300 tokens for all
+**Token use.** Tool definitions are sent with every request: ~3,350 tokens for all
 tools, ~1,600 with `GBTEST_TOOLS=core` (`load_rom wait_frames press set_button
 wait_until screenshot read_memory write_memory run_sequence assert_golden status
 build describe`). A 2× GBA screenshot is ~205 tokens; `describe` is usually under

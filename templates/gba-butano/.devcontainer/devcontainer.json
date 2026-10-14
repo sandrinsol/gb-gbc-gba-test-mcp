@@ -1,0 +1,11 @@
+{
+  "name": "Game Boy Advance homebrew",
+  "build": { "dockerfile": "Dockerfile" },
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": { "username": "vscode" },
+    "ghcr.io/devcontainers/features/node:1": { "version": "22" },
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1": {}
+  },
+  "remoteUser": "vscode",
+  "postCreateCommand": "sudo npx -y playwright install-deps chromium"
+}

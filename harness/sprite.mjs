@@ -10,6 +10,8 @@
 import { writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { decodePng, encodePng, contactSheet } from './png.mjs';
+import { lz77Compress } from './lz77.mjs';
+import { encodeIndexedBmp } from './bmp.mjs';
 import { medianCut } from './recording.mjs';
 
 /** Conversion targets: bits per pixel and visible colours per palette. */
@@ -181,25 +183,40 @@ const hexList = (arr, width, perLine) => {
  *  .h (header-only C), .c (+ a matching .h), .s (GNU as / devkitARM),
  *  .asm or .inc (RGBDS), .bin (NAME.tiles.bin + NAME.pal.bin next to it).
  *  → list of files written */
-export async function writeSpriteSource(conv, file, name) {
+export async function writeSpriteSource(conv, file, name, { compress = 'none' } = {}) {
   const id = name.replace(/\W/g, '_');
   const ext = path.extname(file).toLowerCase();
   await mkdir(path.dirname(path.resolve(file)), { recursive: true });
   const gba = TARGETS[conv.target].system === 'gba';
-  const words = gba ? new Uint32Array(conv.tiles.buffer.slice(conv.tiles.byteOffset, conv.tiles.byteOffset + conv.tiles.length)) : null;
+  if (compress === 'lz77' && !gba) throw new Error('LZ77 compression is for GBA targets (the GBA BIOS decompresses it)');
+  if (ext === '.bmp') {
+    if (!gba) throw new Error('.bmp output is for GBA (Butano/grit)');
+    // Frames stacked vertically, as Butano sprite sheets are; index 0 transparent.
+    const pixels = new Uint8Array(conv.width * conv.height * conv.frames);
+    conv.indices.forEach((idx, f) => pixels.set(idx, f * idx.length));
+    const palette = [[255, 0, 255], ...conv.palette.map(from555)];
+    await writeFile(file, encodeIndexedBmp({ width: conv.width, height: conv.height * conv.frames, pixels, palette, bpp: conv.target === 'gba8' ? 8 : 4 }));
+    const json = file.replace(/\.bmp$/i, '.json');
+    await writeFile(json, JSON.stringify({ type: 'sprite', height: conv.height, ...(conv.target === 'gba8' ? { bpp_mode: 'bpp_8' } : {}), ...(compress === 'lz77' ? { compression: 'lz77' } : {}) }, null, 2) + '\n');
+    return [file, json];
+  }
+  const rawTiles = conv.tiles;
+  const tileData = compress === 'lz77' ? lz77Compress(rawTiles) : rawTiles;
+  const words = gba ? new Uint32Array(tileData.buffer.slice(tileData.byteOffset, tileData.byteOffset + tileData.length)) : null;
   const pal = conv.target === 'gb' ? [] : [0, ...conv.palette]; // slot 0 (transparent) included
   const info = `${conv.frames} frame(s) of ${conv.width}x${conv.height}, ${conv.tilesPerFrame} tile(s) each, ${conv.target}`;
   const defs = [`#define ${id.toUpperCase()}_FRAMES ${conv.frames}`, `#define ${id.toUpperCase()}_TILES_PER_FRAME ${conv.tilesPerFrame}`];
+  if (compress === 'lz77') defs.push(`#define ${id.toUpperCase()}_TILES_LZ77 1 /* BIOS LZ77: LZ77UnCompVram (swi 0x12) */`, `#define ${id.toUpperCase()}_TILES_SIZE ${rawTiles.length} /* bytes once decompressed */`);
   if (conv.target === 'gb') defs.push(`#define ${id.toUpperCase()}_OBP 0x${conv.obp.toString(16).padStart(2, '0')} /* OBP0/OBP1 value */`);
   const cTiles = (pre) => gba
     ? `${pre}const unsigned int ${id}_tiles[${words.length}] = {\n${hexList(words, 8, 8)}\n};`
-    : `${pre}const unsigned char ${id}_tiles[${conv.tiles.length}] = {\n${hexList(conv.tiles, 2, 16)}\n};`;
+    : `${pre}const unsigned char ${id}_tiles[${tileData.length}] = {\n${hexList(tileData, 2, 16)}\n};`;
   const cPal = (pre) => (pal.length ? `${pre}const unsigned short ${id}_pal[${pal.length}] = {\n${hexList(pal, 4, 8)}\n};` : '');
 
   if (ext === '.bin') {
     const base = file.replace(/\.bin$/i, '');
     const files = [`${base}.tiles.bin`];
-    await writeFile(files[0], conv.tiles);
+    await writeFile(files[0], tileData);
     if (pal.length) {
       const p = Buffer.alloc(pal.length * 2);
       pal.forEach((v, i) => p.writeUInt16LE(v, i * 2));
@@ -215,7 +232,7 @@ export async function writeSpriteSource(conv, file, name) {
   }
   if (ext === '.c') {
     const h = file.replace(/\.c$/i, '.h'), guard = `${id.toUpperCase()}_H`;
-    const ext2 = [gba ? `extern const unsigned int ${id}_tiles[${words.length}];` : `extern const unsigned char ${id}_tiles[${conv.tiles.length}];`];
+    const ext2 = [gba ? `extern const unsigned int ${id}_tiles[${words.length}];` : `extern const unsigned char ${id}_tiles[${tileData.length}];`];
     if (pal.length) ext2.push(`extern const unsigned short ${id}_pal[${pal.length}];`);
     await writeFile(h, [`// ${info}`, `#ifndef ${guard}`, `#define ${guard}`, ...defs, ...ext2, '#endif', ''].join('\n'));
     await writeFile(file, [`// ${info}`, `#include "${path.basename(h)}"`, cTiles(''), cPal(''), ''].filter((l) => l !== '').join('\n\n') + '\n');
@@ -223,9 +240,9 @@ export async function writeSpriteSource(conv, file, name) {
   }
   if (ext === '.s') {
     const lines = [`@ ${info}`, '.section .rodata', '.align 2', `.global ${id}_tiles`, `${id}_tiles:`];
-    for (let i = 0; i < (words ? words.length : conv.tiles.length); i += 8) {
+    for (let i = 0; i < (words ? words.length : tileData.length); i += 8) {
       lines.push(words ? `  .word ${Array.from(words.slice(i, i + 8), (v) => '0x' + v.toString(16).padStart(8, '0')).join(', ')}`
-        : `  .byte ${Array.from(conv.tiles.subarray(i, i + 8), (v) => '0x' + v.toString(16).padStart(2, '0')).join(', ')}`);
+        : `  .byte ${Array.from(tileData.subarray(i, i + 8), (v) => '0x' + v.toString(16).padStart(2, '0')).join(', ')}`);
     }
     if (pal.length) {
       lines.push('.align 2', `.global ${id}_pal`, `${id}_pal:`);
@@ -236,7 +253,7 @@ export async function writeSpriteSource(conv, file, name) {
   }
   if (ext === '.asm' || ext === '.inc') {
     const lines = [`; ${info}`, `SECTION "${id}", ROM0`, `${id}_tiles::`];
-    for (let i = 0; i < conv.tiles.length; i += 16) lines.push(`  db ${Array.from(conv.tiles.subarray(i, i + 16), (v) => '$' + v.toString(16).padStart(2, '0')).join(', ')}`);
+    for (let i = 0; i < tileData.length; i += 16) lines.push(`  db ${Array.from(tileData.subarray(i, i + 16), (v) => '$' + v.toString(16).padStart(2, '0')).join(', ')}`);
     lines.push(`${id}_tiles_end::`);
     if (pal.length) {
       lines.push(`${id}_pal::`);

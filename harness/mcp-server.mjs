@@ -37,7 +37,8 @@ import { saveVideo } from './recording.mjs';
 import { convertSprite, writeSpriteSource, injectSprite, overlayFrame, framePng, spriteLimitWarnings } from './sprite.mjs';
 import { RamSearch, SEARCH_OPS, SEARCH_TYPES } from './ramsearch.mjs';
 import { runSteps, decodeValues, encodeValue, VALUE_TYPES } from './steps.mjs';
-import { gbaSprites, gbSprites, drawBoxes, gbaPalettes, gbPalettes, palettesPng, gbaTilesPng, gbTilesPng } from './video.mjs';
+import { gbaSprites, gbSprites, drawBoxes, gbaPalettes, gbPalettes, palettesPng, gbaTilesPng, gbTilesPng, gbIoLines } from './video.mjs';
+import { decodeIo, formatDisplay, formatSystem, renderLayers, gbaSaveType } from './gba.mjs';
 import { screenText, learnCharmap, normalizeCharmap } from './screentext.mjs';
 import { romHeaderIssues, RunChecker } from './checks.mjs';
 import { runCommand, parseDiagnostics, formatDiagnostic, detectBuild, findRom, readProjectConfig } from './build.mjs';
@@ -390,9 +391,9 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
   });
 
   tool('view_vram', {
-    description: 'Image of tile graphics (GBA: region bg/obj, palette bank, bpp8; GB: bank, BG palette) or of all palettes.',
+    description: 'Image of tiles (GBA: region, palette bank, bpp8; GB: bank, palette), palettes, or (GBA) each layer alone + display registers.',
     inputSchema: {
-      what: z.enum(['tiles', 'palettes']).default('tiles'),
+      what: z.enum(['tiles', 'palettes', 'layers']).default('tiles'),
       region: z.enum(['bg', 'obj']).default('bg'),
       palette: z.number().int().min(0).max(15).default(0),
       bpp8: z.boolean().default(false),
@@ -404,6 +405,13 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     const r = await emu.readRegions();
     const cgb = !!r.isCgbWram;
     let img, desc;
+    if (what === 'layers') {
+      if (emu.system !== 'gba') return errText('layers is GBA only; on GB/GBC use describe with io:true and tiles');
+      const layers = renderLayers(r);
+      const sheet = contactSheet(layers.map((l) => l.png), { cols: 3, scale: Math.min(scale, 1) });
+      const order = layers.map((l) => `${l.name}${l.on ? '' : ' (off)'}`).join(', ');
+      return result(`Frame ${await emu.frameNum()}. Layers left→right, top→bottom: ${order}; grey checks = transparent.\n${formatDisplay(decodeIo(r.io)).join('\n')}`, undefined, [png(sheet)]);
+    }
     if (what === 'palettes') {
       img = palettesPng(emu.system === 'gba' ? gbaPalettes(r) : gbPalettes(r, { cgb }));
       desc = emu.system === 'gba' ? '16 BG then 16 OBJ rows of 16 colours' : (cgb ? '8 BG then 8 OBJ palettes' : 'BGP, OBP0, OBP1');
@@ -712,7 +720,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
 
   // ---- Make: sprites ----
   tool('sprite', {
-    description: 'Sprite art. convert: PNG (sheet of width x height frames) to tiles+palette; out=.h/.c/.s/.asm/.bin, animation=.gif. inject: frame into the game at x,y (oam). overlay: draw on screen only. export: sprite index from VRAM.',
+    description: 'Sprite art. convert: PNG (sheet of width x height frames) to tiles+palette; out=.h/.c/.s/.asm/.bin or .bmp (+.json, Butano), animation=.gif. inject: frame into the game at x,y (oam). overlay: draw on screen only. export: sprite index from VRAM.',
     inputSchema: {
       action: z.enum(['convert', 'inject', 'overlay', 'export']),
       png: z.string().optional(),
@@ -721,6 +729,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
       transparent: z.string().optional().describe('alpha|none|#rrggbb'),
       quantize: z.boolean().default(false),
       out: z.string().optional(), name: z.string().optional(),
+      compress: z.enum(['none', 'lz77']).default('none').describe('GBA: BIOS LZ77'),
       animation: z.string().optional(), fps: z.number().positive().default(10),
       frame: z.number().int().min(0).default(0), x: z.number().int().default(0), y: z.number().int().default(0),
       tile: z.number().int().min(0).optional(), palette: z.number().int().min(0).default(0), oam: z.number().int().min(0).default(0),
@@ -743,7 +752,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     const info = `${conv.frames} frame(s) ${conv.width}x${conv.height}, ${conv.palette.length} colour(s), ${conv.tilesPerFrame} tile(s)/frame, ${target}.${conv.warnings.length ? ' WARN: ' + conv.warnings.join('; ') : ''}`;
     if (a.action === 'convert') {
       const files = [];
-      if (a.out) files.push(...(await writeSpriteSource(conv, await writePath(a.out), a.name ?? path.basename(a.png).replace(/\.[^.]+$/, ''))));
+      if (a.out) files.push(...(await writeSpriteSource(conv, await writePath(a.out), a.name ?? path.basename(a.png).replace(/\.[^.]+$/, ''), { compress: a.compress })));
       if (a.animation) {
         const caps = conv.indices.map((idx, i) => ({ frame: Math.round(i * 60 / a.fps), png: framePng(conv, idx) }));
         caps.push({ ...caps[caps.length - 1], frame: Math.round(conv.frames * 60 / a.fps) });
@@ -768,7 +777,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
 
   // ---- Make: backgrounds ----
   tool('background', {
-    description: 'PNG or Tiled .tmx/.tmj map → deduped tiles + tilemap + palettes; out=.c/.h/.s/.asm/.bin; returns a preview rebuilt from them. Fonts: dedupe false.',
+    description: 'PNG or Tiled .tmx/.tmj map → deduped tiles + tilemap + palettes; out=.c/.h/.s/.asm/.bin or .bmp (+.json, Butano); returns a preview rebuilt from them. Fonts: dedupe false.',
     inputSchema: {
       png: z.string().optional(), tiled: z.string().optional(),
       target: z.enum(Object.keys(BG_TARGETS)).optional().describe('default: the loaded ROM\'s'),
@@ -776,6 +785,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
       flips: z.boolean().optional(),
       transparent: z.string().optional().describe('GBA backdrop: alpha|#rrggbb'),
       out: z.string().optional(),
+      compress: z.enum(['none', 'lz77']).default('none').describe('GBA: BIOS LZ77'),
       scale: Scale,
     },
   }, async (a) => {
@@ -785,7 +795,8 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     const src = await resolvePath(a.png ?? a.tiled);
     const img = a.tiled ? await renderTiledMap(src) : await readFile(src);
     const conv = convertBackground(img, { target, dedupe: a.dedupe, flips: a.flips, transparent: a.transparent });
-    const files = a.out ? await writeBackgroundSource(conv, await writePath(a.out), path.basename(a.out).replace(/\.[^.]+$/, '')) : [];
+    const files = a.out ? await writeBackgroundSource(conv, await writePath(a.out), path.basename(a.out).replace(/\.[^.]+$/, ''), { compress: a.compress }) : [];
+    if (a.out && /\.bmp$/i.test(a.out) && (conv.cols % 32 || conv.rows % 32)) conv.warnings.push('Butano regular backgrounds must be 256 or 512 px (or multiples of 256) on each side');
     const sc = Math.max(1, Math.min(a.scale, Math.floor(1600 / (conv.cols * 8))));
     const text = `${conv.cols}x${conv.rows} map, ${conv.tileCount} unique tiles of ${conv.cells}${conv.flipped ? ` (${conv.flipped} reused mirrored)` : ''}, ${conv.palettes.length || 1} palette(s), ${target}.` +
       (conv.warnings.length ? ` WARN: ${conv.warnings.join('; ')}.` : '') + (files.length ? ` Wrote ${files.join(', ')}.` : '');
@@ -858,6 +869,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     inputSchema: {
       charmap: z.any().optional().describe('"ascii" or {first: tile of chars[0], chars}'),
       learn: z.string().optional().describe('text you can see; infers the charmap'),
+      io: z.boolean().default(false).describe('registers in words'),
       image: z.boolean().default(false),
       scale: Scale,
     },
@@ -892,6 +904,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
       lines.push(`screen: ${c.fraction === 0 ? 'unchanged' : `${(c.fraction * 100).toFixed(1)}% changed`} since the last describe`);
     }
     lastDescribe = shot;
+    if (a.io) lines.push(...(emu.system === 'gba' ? (() => { const d = decodeIo(r.io); return [...formatDisplay(d), ...formatSystem(d)]; })() : gbIoLines(r, cpu)));
     return result(lines.join('\n'), undefined, a.image ? [png(scalePng(shot, a.scale))] : []);
   });
 
@@ -927,6 +940,10 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
       }
     } finally { await emu.loadState(saved, { frame: f0 }); }
     found.push(...checker.findings());
+    if (emu.system === 'gba' && !/\.zip$/i.test(romPath) && !gbaSaveType(await readFile(romPath))) {
+      const sav = await emu.readSaveData().catch(() => null);
+      if (sav && sav.some((b) => b !== 0xff && b !== 0)) found.push({ level: 'warn', msg: 'the game wrote save data but the ROM declares no save type (no SRAM_V / FLASH_V / EEPROM_V string): flash carts and emulators may pick the wrong type and lose saves. Add the ID string (devkitARM save libraries and Butano do).' });
+    }
     const errs = found.filter((f) => f.level === 'error').length, warns = found.filter((f) => f.level === 'warn').length;
     const head = `${errs ? `${errs} error(s)` : 'No errors'}, ${warns} warning(s) over ${frames} frames${counterAddr === null ? counterNote || ' (no frame counter: lag not checked)' : ` (frame counter ${label(counterAddr)})`}; state restored.`;
     return result([head, ...found.map((f) => `${f.level === 'ok' ? 'ok' : f.level.toUpperCase()}: ${f.msg}`)].join('\n'), { errors: errs, warnings: warns });

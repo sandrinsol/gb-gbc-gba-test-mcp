@@ -1,0 +1,7 @@
+{
+  "build": "make",
+  "rom": "hello.gba",
+  "charmap": { "first": 0 },
+  "watch": ["player_x:s32", "player_y:s32"],
+  "frameCounter": "frame_counter"
+}

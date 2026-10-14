@@ -29,7 +29,7 @@ const plugin = JSON.parse(await readFile(path.join(REPO, '.claude-plugin', 'plug
 const launch = plugin.mcpServers?.['gb-gbc-gba-test']?.args?.[0]?.replace('${CLAUDE_PLUGIN_ROOT}', REPO);
 ok('plugin version matches', plugin.version === root.version, `${plugin.version} / ${root.version}`);
 ok('plugin starts an existing launcher', !!launch && existsSync(launch), launch);
-ok('plugin skills exist', ['gb-game-testing', 'gb-homebrew-dev', 'gb-ci-tests', 'gb-hardware', 'gb-playtest'].every((n) => existsSync(path.join(REPO, 'skills', n, 'SKILL.md'))));
+ok('plugin skills exist', ['gb-game-testing', 'gb-homebrew-dev', 'gb-ci-tests', 'gb-hardware', 'gb-playtest', 'gba-dev', 'butano'].every((n) => existsSync(path.join(REPO, 'skills', n, 'SKILL.md'))));
 ok('plugin agent exists', existsSync(path.join(REPO, 'agents', 'gb-tester.md')));
 
 const work = await mkdtemp(path.join(tmpdir(), 'gbtest-pkg-'));
@@ -40,7 +40,7 @@ try {
   ok('tarball has the cores', ['data/cores/mgba-wasm.data', 'data/cores/gambatte-wasm.data', 'data/cores/reports/gambatte.json'].every((f) => names.includes(f)));
   ok('tarball has the page + server', names.includes('harness/page.html') && names.includes('harness/mcp-server.mjs'));
   ok('tarball has no tests or sample ROM', !names.some((f) => f.startsWith('harness/tests/') || f.endsWith('.gba')));
-  ok('tarball has the templates without build output', ['templates/gb-asm/src/main.asm', 'templates/gb-c/src/main.c', 'templates/gba-c/gba.ld', 'templates/gba-c/.devcontainer/Dockerfile'].every((f) => names.includes(f)) && !names.some((f) => /^templates\/[^/]+\/build\//.test(f)));
+  ok('tarball has the templates without build output', ['templates/gb-asm/src/main.asm', 'templates/gb-c/src/main.c', 'templates/gba-c/gba.ld', 'templates/gba-c/.devcontainer/Dockerfile', 'templates/gba-tonc/src/main.c', 'templates/gba-butano/graphics/player.bmp'].every((f) => names.includes(f)) && !names.some((f) => /^templates\/[^/]+\/(build\/|[^/]+\.(gba|elf)$)/.test(f)));
 
   await writeFile(path.join(work, 'package.json'), '{"name":"consumer","private":true}');
   // Skip the postinstall; fetch the browser this install's Playwright expects (a

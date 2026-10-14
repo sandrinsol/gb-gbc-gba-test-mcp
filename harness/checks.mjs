@@ -8,6 +8,7 @@
 
 import { gbaSprites, gbSprites } from './video.mjs';
 import { spriteLimitWarnings } from './sprite.mjs';
+import { gbaDisplayIssues, gbaSaveType } from './gba.mjs';
 
 const GB_LOGO = Buffer.from('ceed6666cc0d000b03730083000c000d0008111f8889000edccc6ee6ddddd999bbbb67636e0eecccdddc999fbbb9333e', 'hex');
 // The GBA logo's first bytes: enough to tell "present" from zeros (gbafix writes it).
@@ -30,7 +31,8 @@ export function romHeaderIssues(rom, system) {
     if (rom[0xbd] !== want) err(`header checksum 0xBD is 0x${rom[0xbd].toString(16)}, should be 0x${want.toString(16)} (run gbafix): real hardware will not boot`);
     if ((rom.readUInt32LE(0) >>> 24) !== 0xea) warn('first instruction is not a branch (b start): the header would be executed');
     if (rom.length > 32 * 1024 * 1024) err('ROM is larger than 32 MB');
-    if (!out.length) out.push({ level: 'ok', msg: `GBA header valid (${(rom.length / 1024).toFixed(0)} KB)` });
+    const save = gbaSaveType(rom);
+    if (!out.length) out.push({ level: 'ok', msg: `GBA header valid (${(rom.length / 1024).toFixed(0)} KB, save type ${save ?? 'none declared'})` });
     return out;
   }
   if (rom.length < 0x150) { err('ROM is smaller than its header'); return out; }
@@ -66,6 +68,8 @@ export class RunChecker {
     this.spriteFrames = 0; this.spriteWorst = '';
     this.bitmapObjLow = 0; this.lcdOff = 0; this.forcedBlank = 0;
     this.badPc = null; this.badSp = null; this.haltNoIrq = 0; this.rst38 = 0;
+    /** @type {Map<string, { level: 'error' | 'warn', msg: string, frames: number }>} */
+    this.display = new Map(); // GBA display mistakes, by kind
   }
 
   /** @param {any} regions @param {any} cpu @param {Buffer | null} counterBytes */
@@ -87,6 +91,10 @@ export class RunChecker {
       const dispcnt = regions.io.readUInt16LE(0);
       if ((dispcnt & 7) >= 3 && dispcnt & 0x1000 && sprites.some((s) => s.onScreen && s.tile < 512)) this.bitmapObjLow++;
       if (dispcnt & 0x80) this.forcedBlank++;
+      for (const f of gbaDisplayIssues(regions)) {
+        const seen = this.display.get(f.key);
+        if (seen) seen.frames++; else this.display.set(f.key, { level: f.level, msg: f.msg, frames: 1 });
+      }
       const inRange = (a) => (a < 0x4000) || (a >= 0x02000000 && a < 0x02040000) || (a >= 0x03000000 && a < 0x03008000) || (a >= 0x08000000 && a < 0x0e000000);
       if (!inRange(pc) && this.badPc === null) this.badPc = pc;
       const sp = cpu.sp >>> 0;
@@ -114,6 +122,7 @@ export class RunChecker {
     if (this.lcdOff === n && n > 1) out.push({ level: 'warn', msg: 'the LCD was off the whole time (LCDC bit 7): the screen stays blank' });
     if (this.forcedBlank === n && n > 1) out.push({ level: 'warn', msg: 'forced blank (DISPCNT bit 7) the whole time: the screen stays white' });
     if (this.bitmapObjLow) out.push({ level: 'error', msg: 'bitmap mode (3-5) with sprites using tiles below 512: those tiles are covered by the bitmap and show garbage; use tiles 512+' });
+    for (const f of this.display.values()) out.push({ level: f.level, msg: f.frames < n ? `${f.msg} (${f.frames}/${n} frames)` : f.msg });
     if (this.spriteFrames) out.push({ level: 'warn', msg: `sprite limits exceeded in ${this.spriteFrames}/${n} frames (sprites drop out or flicker): ${this.spriteWorst}` });
     if (this.frameCounter !== null && n > 2) {
       if (this.lag) out.push({ level: 'warn', msg: `${this.lag} of ${n - 1} frames lagged (the frame counter didn't advance): the game loop took longer than a frame` });

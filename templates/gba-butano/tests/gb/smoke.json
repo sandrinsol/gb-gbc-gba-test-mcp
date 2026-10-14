@@ -1,0 +1,13 @@
+{
+  "rom": "hello.gba",
+  "steps": [
+    { "wait": 30 },
+    { "assert": "goldens/title.png" },
+    { "assertRam": "player_x", "as": "s32", "equals": 0 },
+    { "hold": "RIGHT", "frames": 20 },
+    { "assertRam": "player_x", "as": "s32", "min": 15, "max": 20 },
+    { "hold": "DOWN", "frames": 10 },
+    { "assertRam": "player_y", "as": "s32", "min": 5, "max": 10 },
+    { "assert": "goldens/moved.png" }
+  ]
+}
