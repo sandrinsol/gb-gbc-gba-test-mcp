@@ -1,11 +1,13 @@
-# Publishes a GitHub release for the version in package.json: push its tag
-# (git tag v1.4.0 && git push origin v1.4.0), or run this workflow by hand
-# ("Run workflow"), which creates the tag on the commit it runs on. The notes
-# come from .github/release-notes/<tag>.md, else from the merged PRs.
+# Publishes a GitHub release for the version in package.json, tagging the
+# commit, when that version isn't released yet: on every push to main (so
+# merging a version bump releases it), on a pushed v* tag, or by hand ("Run
+# workflow"). The notes come from .github/release-notes/<tag>.md, else from the
+# merged PRs.
 name: release
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
   workflow_dispatch:
 
@@ -32,7 +34,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then echo "$TAG is already released"; exit 1; fi
+          if gh release view "$TAG" >/dev/null 2>&1; then echo "$TAG is already released"; exit 0; fi
           notes=".github/release-notes/$TAG.md"
           args=(--title "$TAG" --target "$GITHUB_SHA")
           if [ -f "$notes" ]; then args+=(--notes-file "$notes"); else args+=(--generate-notes); fi
