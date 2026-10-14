@@ -182,7 +182,7 @@ const textOf = (r) => r.content.filter((c) => c.type === 'text').map((c) => c.te
 
 try {
   const { tools } = await client.listTools();
-  for (const n of ['build', 'describe', 'watch', 'check', 'background', 'new_project']) ok(`tool listed: ${n}`, tools.some((t) => t.name === n));
+  for (const n of ['build', 'describe', 'check', 'background', 'new_project']) ok(`tool listed: ${n}`, tools.some((t) => t.name === n));
 
   let r = await call('build', { command: 'make broken' });
   ok('build: failure lists the compiler error', r.isError && textOf(r).includes('src/main.asm:3:1: error: nope') && textOf(r).includes('exit 2'), textOf(r));
@@ -211,8 +211,8 @@ try {
   dt = textOf(await call('describe', { image: true }));
   ok('describe: reports change since the last one', /screen: [\d.]+% changed since the last describe/.test(dt), dt);
 
-  r = await call('watch', { vars: ['wPlayerY', 'wFrameCounter'] });
-  ok('watch: replaces the list', /^watch: wPlayerY=64 wFrameCounter=\d+$/.test(textOf(r)), textOf(r));
+  r = await call('describe', { watch: ['wPlayerY', 'wFrameCounter'] });
+  ok('describe watch: replaces the list', /\nwatch: wPlayerY=64 wFrameCounter=\d+\n/.test(textOf(r)), textOf(r));
   r = await call('wait_frames', { frames: 1 });
   ok('watch: shown after waits', /watch: wPlayerY=64 wFrameCounter=\d+/.test(textOf(r)));
 

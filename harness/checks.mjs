@@ -8,7 +8,7 @@
 
 import { gbaSprites, gbSprites } from './video.mjs';
 import { spriteLimitWarnings } from './sprite.mjs';
-import { gbaDisplayIssues, gbaSaveType } from './gba.mjs';
+import { gbaDisplayIssues, gbaSaveType, gbaSoundIssues, vramBudget, decodeIo } from './gba.mjs';
 
 const GB_LOGO = Buffer.from('ceed6666cc0d000b03730083000c000d0008111f8889000edccc6ee6ddddd999bbbb67636e0eecccdddc999fbbb9333e', 'hex');
 // The GBA logo's first bytes: enough to tell "present" from zeros (gbafix writes it).
@@ -60,8 +60,10 @@ export function romHeaderIssues(rom, system) {
 
 /** Collects per-frame observations and turns them into findings. */
 export class RunChecker {
-  /** @param {'gb'|'gba'} system @param {{ frameCounter?: number | null, counterWidth?: number }} [opts] */
-  constructor(system, { frameCounter = null, counterWidth = 1 } = {}) {
+  /** @param {'gb'|'gba'} system @param {{ frameCounter?: number | null, counterWidth?: number, cpuUsage?: number | null }} [opts] */
+  constructor(system, { frameCounter = null, counterWidth = 1, cpuUsage = null } = {}) {
+    this.cpuUsage = cpuUsage; this.cpu = [];
+    this.objPeak = 0; this.objTotal = 1024; this.objPalPeak = 0; this.anySound = false;
     this.system = system;
     this.frameCounter = frameCounter; this.counterWidth = counterWidth;
     this.frames = 0; this.lag = 0; this.lastCounter = null;
@@ -72,8 +74,10 @@ export class RunChecker {
     this.display = new Map(); // GBA display mistakes, by kind
   }
 
-  /** @param {any} regions @param {any} cpu @param {Buffer | null} counterBytes */
-  observe(regions, cpu, counterBytes) {
+  /** @param {any} regions @param {any} cpu @param {Buffer | null} counterBytes
+   *  @param {number | null} [cpuPercent] the game's own CPU-usage variable, in % of a frame */
+  observe(regions, cpu, counterBytes, cpuPercent = null) {
+    if (cpuPercent !== null) this.cpu.push(cpuPercent);
     this.frames++;
     const gba = this.system === 'gba';
     const sprites = gba ? gbaSprites(regions) : gbSprites(regions, { cgb: !!regions.isCgbWram });
@@ -91,7 +95,13 @@ export class RunChecker {
       const dispcnt = regions.io.readUInt16LE(0);
       if ((dispcnt & 7) >= 3 && dispcnt & 0x1000 && sprites.some((s) => s.onScreen && s.tile < 512)) this.bitmapObjLow++;
       if (dispcnt & 0x80) this.forcedBlank++;
-      for (const f of gbaDisplayIssues(regions)) {
+      const io = decodeIo(regions.io);
+      if (io.sound.master && (io.sound.a.left || io.sound.a.right || io.sound.b.left || io.sound.b.right || io.sound.psg.some((c) => c.left || c.right))) this.anySound = true;
+      if (this.frames % 10 === 1) {
+        const b = vramBudget(regions);
+        this.objPeak = Math.max(this.objPeak, b.objUsed); this.objTotal = b.objTotal; this.objPalPeak = Math.max(this.objPalPeak, b.objPal);
+      }
+      for (const f of [...gbaDisplayIssues(regions), ...gbaSoundIssues(io)]) {
         const seen = this.display.get(f.key);
         if (seen) seen.frames++; else this.display.set(f.key, { level: f.level, msg: f.msg, frames: 1 });
       }
@@ -123,6 +133,18 @@ export class RunChecker {
     if (this.forcedBlank === n && n > 1) out.push({ level: 'warn', msg: 'forced blank (DISPCNT bit 7) the whole time: the screen stays white' });
     if (this.bitmapObjLow) out.push({ level: 'error', msg: 'bitmap mode (3-5) with sprites using tiles below 512: those tiles are covered by the bitmap and show garbage; use tiles 512+' });
     for (const f of this.display.values()) out.push({ level: f.level, msg: f.frames < n ? `${f.msg} (${f.frames}/${n} frames)` : f.msg });
+    if (this.system === 'gba') {
+      if (this.objPeak >= this.objTotal * 0.9) out.push({ level: 'warn', msg: `sprite tile memory nearly full (${this.objPeak}/${this.objTotal} slots hold data): new sprites will fail to load (Butano asserts "no more sprite tiles")` });
+      if (this.objPalPeak >= 16) out.push({ level: 'warn', msg: 'all 16 sprite palette banks are in use: the next sprite with new colours has no palette' });
+      if (!this.anySound) out.push({ level: 'ok', msg: 'no sound set up during the run (silent)' });
+    }
+    if (this.cpu.length) {
+      const max = Math.max(...this.cpu), min = Math.min(...this.cpu), avg = Math.round(this.cpu.reduce((a, b) => a + b, 0) / this.cpu.length);
+      const msg = `CPU ${min}-${max}% of a frame (average ${avg}%)`;
+      if (max >= 100) out.push({ level: 'warn', msg: `${msg}: at ${max}% the game misses frames there (slowdown)` });
+      else if (max >= 90) out.push({ level: 'warn', msg: `${msg}: close to the limit, any more work will cause slowdown` });
+      else out.push({ level: 'ok', msg });
+    }
     if (this.spriteFrames) out.push({ level: 'warn', msg: `sprite limits exceeded in ${this.spriteFrames}/${n} frames (sprites drop out or flicker): ${this.spriteWorst}` });
     if (this.frameCounter !== null && n > 2) {
       if (this.lag) out.push({ level: 'warn', msg: `${this.lag} of ${n - 1} frames lagged (the frame counter didn't advance): the game loop took longer than a frame` });

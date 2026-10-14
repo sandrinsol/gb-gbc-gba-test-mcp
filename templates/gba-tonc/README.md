@@ -16,7 +16,7 @@ with the D-pad, plus a test that checks both.
 `gbtest.json` tells the test harness how to build and load the game, how to read
 on-screen text (`charmap`: tonc's font starts with the space at tile 0), which
 variables to report after each step (`watch`) and which one counts frames
-(`frameCounter`, for lag checks).
+(`frameCounter`, for lag checks) and which holds the CPU load (`cpuUsage`).
 
 The goldens in `tests/gb/goldens/` are created on the first run; delete them when
 you change what the screen should look like.

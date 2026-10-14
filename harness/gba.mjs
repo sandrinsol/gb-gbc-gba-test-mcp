@@ -58,6 +58,15 @@ export function decodeIo(io) {
       return { n, on: !!(ctl & 0x80), prescaler: [1, 64, 256, 1024][ctl & 3], cascade: !!(ctl & 4), irq: !!(ctl & 0x40), value: r16(0x100 + n * 4) };
     }),
     irq: { ime: !!(r16(0x208) & 1), ie: irqs(r16(0x200)), if: irqs(r16(0x202)) },
+    sound: (() => {
+      const scl = r16(0x80), sch = r16(0x82), scx = r16(0x84);
+      const ds = (shift, volBit) => ({ vol: sch & volBit ? 100 : 50, right: !!(sch & (0x100 << shift)), left: !!(sch & (0x200 << shift)), timer: (sch >> (10 + shift)) & 1 });
+      return {
+        master: !!(scx & 0x80), psgVolume: [25, 50, 100, 0][sch & 3], psgRight: scl & 7, psgLeft: (scl >> 4) & 7,
+        psg: [1, 2, 3, 4].map((c) => ({ n: c, right: !!(scl & (0x80 << c)), left: !!(scl & (0x800 << c)) })),
+        a: ds(0, 4), b: ds(4, 8),
+      };
+    })(),
     waitcnt: r16(0x204),
   };
 }
@@ -85,11 +94,94 @@ export function formatDisplay(d) {
   return lines;
 }
 
+const IO_NAMES = {
+  0x00: 'DISPCNT', 0x10: 'BG0HOFS', 0x12: 'BG0VOFS', 0x14: 'BG1HOFS', 0x16: 'BG1VOFS', 0x18: 'BG2HOFS', 0x1a: 'BG2VOFS', 0x1c: 'BG3HOFS', 0x1e: 'BG3VOFS',
+  0x20: 'BG2PA', 0x22: 'BG2PB', 0x24: 'BG2PC', 0x26: 'BG2PD', 0x28: 'BG2X', 0x2c: 'BG2Y', 0x30: 'BG3PA', 0x32: 'BG3PB', 0x34: 'BG3PC', 0x36: 'BG3PD', 0x38: 'BG3X', 0x3c: 'BG3Y',
+  0x40: 'WIN0H', 0x42: 'WIN1H', 0x44: 'WIN0V', 0x46: 'WIN1V', 0x48: 'WININ', 0x4a: 'WINOUT', 0x4c: 'MOSAIC', 0x50: 'BLDCNT', 0x52: 'BLDALPHA', 0x54: 'BLDY', 0xa0: 'FIFO A', 0xa4: 'FIFO B',
+};
+
+/** What a DMA channel is doing, in words. */
+export function dmaPurpose(x) {
+  const d = x.dst >>> 0;
+  if (d === 0x040000a0 || d === 0x040000a4) return `feeds DirectSound FIFO ${d === 0x040000a0 ? 'A' : 'B'} (sound samples)`;
+  if (x.timing !== 'hblank') return null;
+  if (d >= 0x05000000 && d < 0x05000400) return 'per-scanline palette writes (colour gradient / raster effect)';
+  if (d >> 24 !== 4) return null;
+  const name = IO_NAMES[d & 0x3fe] ?? `I/O ${hex(d)}`;
+  const o = d & 0x3ff;
+  const kind = o >= 0x10 && o < 0x20 ? 'scroll per line: wave, parallax or split-screen'
+    : o >= 0x20 && o < 0x40 ? 'affine per line: mode 7 / perspective floor'
+      : o >= 0x40 && o < 0x4c ? 'window shape per line'
+        : o >= 0x50 && o < 0x56 ? 'blending per line' : 'a register per line';
+  return `per-scanline ${name} (${kind})`;
+}
+
+/** Sample rate of a timer clocking DirectSound (prescaler 1: 16.78 MHz / (65536 - reload)). */
+const timerRate = (t) => (t.on && !t.cascade && t.value < 65536 ? Math.round(16777216 / t.prescaler / (65536 - t.value)) : 0);
+
+/** The sound registers as short lines of text. */
+export function formatSound(d) {
+  const s = d.sound;
+  if (!s.master) return ['sound: master OFF (SOUNDCNT_X bit 7): silent'];
+  const fifo = (n) => d.dma.find((x) => x.on && (x.dst >>> 0) === (n === 'A' ? 0x040000a0 : 0x040000a4));
+  const side = (c) => (c.left && c.right ? 'L+R' : c.left ? 'L' : c.right ? 'R' : 'muted');
+  const ds = (n, c) => {
+    if (!c.left && !c.right) return `DirectSound ${n} off`;
+    const t = d.timers[c.timer], dma = fifo(n);
+    return `DirectSound ${n} ${c.vol}% ${side(c)} · timer ${c.timer}${t.on ? ` ${timerRate(t)} Hz` : ' STOPPED'}${dma ? ` · fed by DMA${dma.n}` : ' · no DMA feeding it'}`;
+  };
+  const psg = s.psg.filter((c) => c.left || c.right);
+  return [
+    `sound: master on · ${ds('A', s.a)} · ${ds('B', s.b)}`,
+    `PSG (GB channels) ${s.psgVolume}%: ${psg.length ? psg.map((c) => `ch${c.n} ${side(c)}`).join(', ') : 'none routed'}`,
+  ];
+}
+
+/** Sound set-up mistakes: [{ key, level, msg }]. */
+export function gbaSoundIssues(d) {
+  const s = d.sound, out = [];
+  for (const [n, c, addr] of [['A', s.a, 0x040000a0], ['B', s.b, 0x040000a4]]) {
+    const dma = d.dma.find((x) => x.on && (x.dst >>> 0) === addr);
+    if (!dma) continue;
+    if (!s.master) out.push({ key: 'soundmaster', level: 'error', msg: `DMA${dma.n} feeds DirectSound FIFO ${n} but the sound master switch is off (SOUNDCNT_X bit 7 = 0): nothing plays` });
+    else if (!c.left && !c.right) out.push({ key: `sound${n}route`, level: 'warn', msg: `DirectSound ${n} receives samples (DMA${dma.n}) but isn't routed to the left or right speaker (SOUNDCNT_H)` });
+    if (!d.timers[c.timer].on) out.push({ key: `sound${n}timer`, level: 'error', msg: `DirectSound ${n} is clocked by timer ${c.timer}, which is stopped: no samples are played (start TM${c.timer} with the sample-rate reload value)` });
+  }
+  return out;
+}
+
+/** How much VRAM and palette the current frame uses: text lines and figures. */
+export function vramBudget(r) {
+  const d = decodeIo(r.io), vram = r.vram, pram = r.pram;
+  const ranges = [];
+  for (const bg of d.bgs.filter((b) => b.on && (b.kind === 'text' || b.kind === 'affine'))) {
+    const x = layerRanges(r, bg);
+    if (x.maxTile >= 0) ranges.push([x.charStart, x.charEnd]);
+    ranges.push([x.mapStart, x.mapEnd]);
+  }
+  if (d.mode >= 3) ranges.push([0, d.mode === 3 ? 0x12c00 : 0x14000]);
+  ranges.sort((a, b) => a[0] - b[0]);
+  let bgBytes = 0, end = -1;
+  for (const [a, b] of ranges) { if (b <= end) continue; bgBytes += b - Math.max(a, end); end = b; }
+  const firstObj = d.mode >= 3 ? 512 : 0;
+  let objUsed = 0;
+  for (let t = firstObj; t < 1024; t++) {
+    const o = 0x10000 + t * 32;
+    for (let i = 0; i < 32; i++) if (vram[o + i]) { objUsed++; break; }
+  }
+  const banks = (base) => { let n = 0; for (let b = 0; b < 16; b++) { for (let c = 1; c < 16; c++) if (pram.readUInt16LE(base + (b * 16 + c) * 2)) { n++; break; } } return n; };
+  const objTotal = 1024 - firstObj, bgPal = banks(0), objPal = banks(0x200);
+  return {
+    objUsed, objTotal, bgPal, objPal, bgBytes,
+    lines: [`memory: BG VRAM ${(Math.min(bgBytes, 0x10000) / 1024).toFixed(1)} of 64 KB used by the visible layers · OBJ tiles ${objUsed}/${objTotal} slots hold data · palette banks in use: BG ${bgPal}/16, OBJ ${objPal}/16`],
+  };
+}
+
 /** Interrupts, DMA, timers and wait states as short lines of text. */
 export function formatSystem(d) {
   const lines = [`interrupts: IME ${d.irq.ime ? 'on' : 'OFF'} · enabled ${d.irq.ie.join(', ') || 'none'}${d.irq.if.length ? ` · pending ${d.irq.if.join(', ')}` : ''}${d.dispstat.vblankIrq ? '' : (d.irq.ie.includes('vblank') ? ' · DISPSTAT VBlank IRQ bit OFF (no VBlank interrupts)' : '')}`];
   const dma = d.dma.filter((x) => x.on);
-  lines.push(`dma: ${dma.length ? dma.map((x) => `DMA${x.n} ${hex(x.src)}→${hex(x.dst)} ×${x.count} ${x.word ? '32' : '16'}-bit ${x.timing}${x.repeat ? ' repeat' : ''}`).join(' · ') : 'idle'}`);
+  lines.push(`dma: ${dma.length ? dma.map((x) => { const p = dmaPurpose(x); return `DMA${x.n} ${hex(x.src)}→${hex(x.dst)} ×${x.count} ${x.word ? '32' : '16'}-bit ${x.timing}${x.repeat ? ' repeat' : ''}${p ? `: ${p}` : ''}`; }).join(' · ') : 'idle'}`);
   const tm = d.timers.filter((x) => x.on);
   lines.push(`timers: ${tm.length ? tm.map((x) => `TM${x.n} ${x.cascade ? 'cascade' : `1/${x.prescaler}`}${x.irq ? ' irq' : ''} =${x.value}`).join(' · ') : 'off'}`);
   const wc = d.waitcnt;
@@ -252,7 +344,13 @@ export function gbaDisplayIssues(r) {
     add('obj2d', 'warn', 'sprites use 2D tile mapping (DISPCNT bit 6 clear) but some are bigger than 8x8: if their tiles were loaded one after another (grit, Butano, the sprite tool), set bit 6 for 1D mapping or they show scrambled');
   }
   const pram = r.pram;
-  for (const s of sprites) {
+  // Only sprites that have graphics loaded (blank tiles draw nothing anyway).
+  const hasPixels = (s) => {
+    const start = 0x10000 + (s.tile & 0x3ff) * 32, len = (s.w / 8) * (s.h / 8) * (s.bpp8 ? 64 : 32);
+    for (let i = start; i < Math.min(start + len, 0x18000); i++) if (r.vram[i]) return true;
+    return false;
+  };
+  for (const s of sprites.filter(hasPixels)) {
     const black = s.bpp8 ? allZero(pram, 0x202, 0x400) : allZero(pram, 0x200 + s.palette * 32 + 2, 0x200 + s.palette * 32 + 32);
     if (black) { add(`objpal${s.bpp8 ? 'x' : s.palette}`, 'warn', `sprite #${s.index} uses ${s.bpp8 ? 'the 256-colour OBJ palette' : `OBJ palette bank ${s.palette}`}, which is all black: load its palette (0x05000200${s.bpp8 ? '' : ` + ${s.palette * 32}`})`); }
   }

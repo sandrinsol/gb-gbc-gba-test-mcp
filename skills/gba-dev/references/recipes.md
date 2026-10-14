@@ -46,7 +46,10 @@ typedef int FIXED;                      // 24.8
 #define fxmul(a, b) (((a) * (b)) >> FIX_SHIFT)
 // velocity 1.5 px/frame: vx = 0x180; x += vx; screen x = fx2int(x)
 ```
-Sine/cosine: a 512-entry lookup table (libtonc `lu_sin(angle)` returns .12 fixed).
+Sine/cosine: a 512-entry lookup table (libtonc `lu_sin(angle)` returns .12 fixed),
+or generate one with the `data` tool (`kind: "table"`, `table: "sin"`, `bits: 12`).
+Division by a variable: multiply by a reciprocal table (`table: "reciprocal"`) and
+shift right by its fractional bits.
 
 ## Affine sprite (rotate / scale)
 
@@ -85,9 +88,29 @@ shared with variables and the stack.
 - Flash and EEPROM need command sequences: use a library (Butano `bn::sram`,
   devkitPro's `gba-save` code) rather than writing them by hand.
 
+## Sound effects with DirectSound (no library)
+
+Convert with the `data` tool (`kind: "sound"`, `out: "src/gfx/jump.c"`): signed
+8-bit samples plus `JUMP_TIMER_RELOAD` and `JUMP_LENGTH`. Then:
+```c
+REG_SOUNDCNT_X = 0x0080;                 // master on (first)
+REG_SOUNDCNT_H = 0x0B04;                 // DirectSound A 100%, left+right, timer 0, reset FIFO A
+REG_DMA1SAD = (u32)jump;                 // samples
+REG_DMA1DAD = (u32)&REG_FIFO_A;          // 0x040000A0
+REG_DMA1CNT = 0xB6400000;                // enable | FIFO timing | 32-bit | repeat | dest fixed
+REG_TM0D    = JUMP_TIMER_RELOAD;         // sample rate
+REG_TM0CNT  = TM_ENABLE;                 // prescaler 1
+// stop after JUMP_LENGTH samples (≈ JUMP_LENGTH / rate * 59.73 frames): REG_DMA1CNT = 0; REG_TM0CNT = 0;
+```
+18157 Hz (reload 64612) gives exactly 304 samples per frame, which makes
+VBlank-timed double buffering easy. `describe` with `io: true` shows whether this is
+set up (rate, which DMA feeds the FIFO) and `check` flags a stopped timer or the
+master switch left off.
+
 ## Sound with Maxmod (devkitARM)
 
-Put `.it .mod .s3m .xm` music and `.wav` effects in an audio folder; `mmutil`
+Put `.it .mod .s3m .xm` music and `.wav` effects (the `data` tool writes clean 8-bit
+WAVs at the rate you pick) in an audio folder; `mmutil`
 builds `soundbank.bin` + `soundbank.h`. Then:
 ```c
 mmInitDefault((mm_addr)soundbank_bin, 8);   // 8 channels

@@ -79,9 +79,8 @@ Start a game from a template with the `new_project` tool, or from the clone:
 | `view_vram` | Tiles or palettes as an image; on GBA also `layers`: each background and the sprite layer on its own, with the display registers decoded. |
 | `status` | ROM, frame, held buttons, saved states, cheats. |
 | `write_memory` | Write RAM on the current frame. |
-| `save_state` / `load_state` | Named snapshots, optionally to/from a file. |
-| `set_cheats` | GameShark, Action Replay, CodeBreaker (GBA); GameShark, Game Genie (GB). |
-| `battery_save` | Export or import the `.sav`. |
+| `state` | Save or load named snapshots, optionally to/from a file. |
+| `cartridge` | Cheats (GameShark, Action Replay, CodeBreaker on GBA; GameShark, Game Genie on GB) and the battery `.sav` (export or import). |
 | `run_sequence` | Run a list of steps in one call (see [Steps](#steps)). |
 | `assert_golden` | Compare the frame (or one sprite, `sprite: N`) to a golden PNG; on failure returns current, golden and diff images. |
 | `record_video` | Play N frames into `.gif`, animated `.png`, `.webm`, `.mp4` (with sound) or `.wav`. |
@@ -91,16 +90,16 @@ Start a game from a template with the `new_project` tool, or from the clone:
 | `sprite` | Sprite art: `convert` a PNG to tiles + palette (source for your toolchain, or `.bmp` + `.json` for Butano; GBA `compress: "lz77"`), `inject` it into the running game, `overlay` it on the screen, `export` a sprite from VRAM. |
 | `background` | Background art, fonts or a Tiled map (`.tmx`/`.tmj`) to tiles + tilemap + palettes, with duplicate and mirrored tiles merged (same outputs and compression); returns a preview rebuilt from the output. |
 | `build` | Run the project's build, report compiler errors as `file:line: error: …`, load the new ROM with its symbols, check its header; `replay` returns to where you were. |
-| `describe` | The screen as text: on-screen text, sprites, watched variables, how much changed; `io: true` adds the display, interrupt, DMA and timer registers in words. |
-| `watch` | Variables to report after every step that advances time. |
-| `check` | Hardware rules: ROM header and save type, then a short run watching for crashes, a bad stack, sprite overflow, a blank screen and lag frames; on GBA also maps overlapping tile data, 2D sprite mapping with 1D tiles, black palettes, all-zero affine matrices, bitmap-mode sprite tiles and save data without a save-type string. |
+| `describe` | The screen as text: on-screen text, sprites, watched variables, how much changed; `watch` sets the variables every step reports; `io: true` adds the display, interrupt, DMA, timer and sound registers and (GBA) memory use in words. |
+| `check` | Hardware rules: ROM header and save type, then a short run watching for crashes, a bad stack, sprite overflow, a blank screen, lag frames and CPU load (with a `cpu_usage` variable); on GBA also maps overlapping tile data, 2D sprite mapping with 1D tiles, black palettes, all-zero affine matrices, bitmap-mode sprite tiles, nearly full sprite memory, DirectSound set-up mistakes and save data without a save-type string. |
+| `data` | Sound effects (WAV → GBA DirectSound 8-bit PCM with the timer value, or clean 8-bit WAVs for Maxmod/Butano) and fixed-point lookup tables (sin, cos, reciprocal). |
 | `new_project` | Copy a starter template. |
 
 Prompts: `smoke_test_rom`, `regression_check`, `find_ram_address`,
 `record_regression_test`. Resources: `emu://screen`, `emu://status`.
 
-**Token use.** Tool definitions are sent with every request: ~3,350 tokens for all
-tools, ~1,600 with `GBTEST_TOOLS=core` (`load_rom wait_frames press set_button
+**Token use.** Tool definitions are sent with every request: ~3,450 tokens for all
+tools, ~1,650 with `GBTEST_TOOLS=core` (`load_rom wait_frames press set_button
 wait_until screenshot read_memory write_memory run_sequence assert_golden status
 build describe`). A 2× GBA screenshot is ~205 tokens; `describe` is usually under
 100. Prefer one `run_sequence` over many single calls, and `wait_until` over
@@ -123,7 +122,8 @@ function the CPU is in.
   "symbols": "build/game.sym",
   "charmap": "ascii",
   "watch": ["player_x", "lives:u16"],
-  "frameCounter": "frame_count"
+  "frameCounter": "frame_count",
+  "cpuUsage": "cpu_usage"
 }
 ```
 
@@ -131,7 +131,8 @@ function the CPU is in.
 character code) or `{"first": <tile of the first char>, "chars": "<chars in tile
 order>"}`; `describe` with `learn: "<text on screen>"` works it out for fonts in
 ASCII order. `frameCounter` is a variable the game loop increments once per frame;
-`check` counts the frames where it didn't (lag).
+`check` counts the frames where it didn't (lag). `cpuUsage` is a variable holding the
+percentage of the last frame the game spent working; `check` reports its range.
 
 ## Steps
 

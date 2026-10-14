@@ -9,6 +9,7 @@
 
 #define REG_DISPCNT  (*(volatile uint16_t *)0x04000000)
 #define REG_DISPSTAT (*(volatile uint16_t *)0x04000004)
+#define REG_VCOUNT   (*(volatile uint16_t *)0x04000006)
 #define REG_BG0CNT   (*(volatile uint16_t *)0x04000008)
 #define REG_KEYINPUT (*(volatile uint16_t *)0x04000130)
 #define REG_IE       (*(volatile uint16_t *)0x04000200)
@@ -33,6 +34,7 @@ extern void irq_handler(void);
 
 int player_x = 112, player_y = 64;
 uint32_t frame_counter;
+int cpu_usage;  // % of the last frame spent on game logic (tests read it)
 
 // Sleep until the next VBlank (BIOS VBlankIntrWait); VRAM, OAM and palettes are
 // safe to change until the next frame starts drawing.
@@ -81,5 +83,9 @@ int main(void) {
         OAM[1] = (player_x & 0x1ff) | (1 << 14);  // 16x16
         OAM[2] = 0;                               // tile 0, palette bank 0
         frame_counter++;
+        // Work started at the top of VBlank (line 160): the lines since then are
+        // the CPU time used (228 lines = one frame). x * 449 >> 10 ≈ x * 100 / 228
+        // without a division.
+        cpu_usage = (((REG_VCOUNT + 228 - 160) % 228) * 449) >> 10;
     }
 }

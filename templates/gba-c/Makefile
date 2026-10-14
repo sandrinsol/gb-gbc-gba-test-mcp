@@ -5,7 +5,7 @@ CC      := arm-none-eabi-gcc
 OBJCOPY := arm-none-eabi-objcopy
 NAME    := hello
 BUILD   := build
-SRC     := src/main.c src/gfx/font.c src/gfx/player.c src/crt0.s
+SRC     := $(wildcard src/*.c src/gfx/*.c) src/crt0.s
 
 CFLAGS  := -mcpu=arm7tdmi -mthumb -mthumb-interwork -O2 -g -Wall -Wextra \
            -ffreestanding -fno-strict-aliasing

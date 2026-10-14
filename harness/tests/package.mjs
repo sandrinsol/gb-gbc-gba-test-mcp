@@ -29,8 +29,8 @@ const plugin = JSON.parse(await readFile(path.join(REPO, '.claude-plugin', 'plug
 const launch = plugin.mcpServers?.['gb-gbc-gba-test']?.args?.[0]?.replace('${CLAUDE_PLUGIN_ROOT}', REPO);
 ok('plugin version matches', plugin.version === root.version, `${plugin.version} / ${root.version}`);
 ok('plugin starts an existing launcher', !!launch && existsSync(launch), launch);
-ok('plugin skills exist', ['gb-game-testing', 'gb-homebrew-dev', 'gb-ci-tests', 'gb-hardware', 'gb-playtest', 'gba-dev', 'butano'].every((n) => existsSync(path.join(REPO, 'skills', n, 'SKILL.md'))));
-ok('plugin agent exists', existsSync(path.join(REPO, 'agents', 'gb-tester.md')));
+ok('plugin skills exist', ['gb-game-testing', 'gb-homebrew-dev', 'gb-ci-tests', 'gb-hardware', 'gb-playtest', 'gba-dev', 'butano', 'gba-performance', 'gba-real-hardware'].every((n) => existsSync(path.join(REPO, 'skills', n, 'SKILL.md'))));
+ok('plugin agents exist', ['gb-tester', 'gba-reviewer'].every((n) => existsSync(path.join(REPO, 'agents', `${n}.md`))));
 
 const work = await mkdtemp(path.join(tmpdir(), 'gbtest-pkg-'));
 try {
