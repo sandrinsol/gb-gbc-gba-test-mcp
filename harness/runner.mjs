@@ -48,7 +48,8 @@ const outDir = path.resolve(
 const emu = await EmuHarness.launch(script.rom);
 let result;
 try {
-  result = await runSteps(emu, script.steps, { outDir, baseDir: path.dirname(absScript), log: console.log });
+  // Optional "video": { "path": "fail.mp4", "onlyOnFail": true, "seconds": 10 } records the run.
+  result = await runSteps(emu, script.steps, { outDir, baseDir: path.dirname(absScript), log: console.log, video: script.video });
 } finally {
   await emu.close();
 }
@@ -62,5 +63,6 @@ await writeFile(
   JSON.stringify({ rom: script.rom, outDir: rel(outDir), pass: failures === 0, steps: timeline }, null, 2)
 );
 
+if (result.video) console.log(`Video -> ${rel(result.video)}`);
 console.log(`\nTimeline -> ${rel(path.join(outDir, 'timeline.json'))}  (${shotCount} screenshots, ${failures} failed assert${failures === 1 ? '' : 's'})`);
 process.exit(failures ? 1 : 0);

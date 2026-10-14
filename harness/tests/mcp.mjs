@@ -51,7 +51,7 @@ try {
   const names = tools.map((t) => t.name);
   const ALL = ['load_rom', 'wait_frames', 'press', 'set_button', 'wait_until', 'reset', 'screenshot', 'read_memory',
     'read_cpu', 'read_sprites', 'view_vram', 'status', 'write_memory', 'save_state', 'load_state', 'set_cheats',
-    'battery_save', 'run_sequence', 'assert_golden', 'export_script', 'ab_compare', 'ram_search'];
+    'battery_save', 'run_sequence', 'assert_golden', 'export_script', 'ab_compare', 'ram_search', 'record_video'];
   for (const n of ALL) ok(`tool listed: ${n}`, names.includes(n));
   ok('exactly the documented tools', names.length === ALL.length, `${names.length}`);
   ok('screenshot is annotated read-only', tools.find((t) => t.name === 'screenshot').annotations?.readOnlyHint === true);
@@ -151,6 +151,12 @@ try {
   ok('emu://status resource', JSON.parse(res.contents[0].text).system === 'GBA');
   const scr = /** @type {any} */ (await client.readResource({ uri: 'emu://screen' }));
   ok('emu://screen resource is a PNG', decodePng(Buffer.from(scr.contents[0].blob, 'base64')).width === 240);
+
+  // --- Video ---
+  r = await call('record_video', { frames: 30, path: 'harness/out/mcp-test/clip.gif' });
+  ok('record_video writes a GIF', !r.isError && existsSync(path.join(OUT, 'clip.gif')), textOf(r));
+  r = await call('run_sequence', { steps: [{ wait: 10 }, { assertRam: '0x02000100', as: 'u16', equals: 1 }], video: { path: 'harness/out/mcp-test/fail.gif', seconds: 1 } });
+  ok('run_sequence video kept on failure', r.isError && existsSync(path.join(OUT, 'fail.gif')) && /Video: /.test(textOf(r)), textOf(r).split('\n')[0]);
 
   // --- Golden ignore masks ---
   r = await call('assert_golden', { golden: 'harness/out/mcp-test/black.png', threshold: 0, ignore: [{ x: 0, y: 0, w: 240, h: 160 }] });

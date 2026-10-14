@@ -122,6 +122,89 @@
       throw new Error('could not restore the save state exactly');
     };
 
+    // ---- Frame capture ----
+    // The core renders a screenshot when its main loop processes the request, at
+    // the start of the next iteration — i.e. it shows the frame current when the
+    // request was made. So one request per iteration while running captures every
+    // frame (verified identical to paused screenshots of the same frames).
+    const SHOT = '/screenshot.png';
+    const requestShot = () => { try { gm().FS.unlink(SHOT); } catch {} gm().functions.screenshot(); };
+    const readShot = () => { try { return gm().FS.readFile(SHOT); } catch { return null; } };
+
+    // ---- Audio ----
+    // The core's audio goes out through Emscripten's OpenAL, which creates one
+    // AudioBuffer per chunk. Normally the driver drops or repeats chunks depending
+    // on the real audio clock (suspended in headless Chrome); driving that clock
+    // from the emulated frame counter instead makes the sample stream identical on
+    // every run, fast-forward included. While recording, chunks are collected.
+    Emu._audio = null; // { chunks: AudioBuffer[] } while recording
+    Emu.initAudio = () => {
+      const ctx = gm().Module.AL && gm().Module.AL.currentCtx && gm().Module.AL.currentCtx.audioCtx;
+      if (!ctx || ctx.__gbtest) return !!ctx;
+      const base = ctx.currentTime, f0 = gm().getFrameNum();
+      Object.defineProperty(ctx, 'currentTime', { configurable: true, get: () => base + (gm().getFrameNum() - f0) / 60 });
+      const create = ctx.createBuffer.bind(ctx);
+      ctx.createBuffer = (...a) => { const b = create(...a); if (Emu._audio) Emu._audio.chunks.push(b); return b; };
+      ctx.__gbtest = true;
+      return true;
+    };
+    // Interleaved 16-bit PCM of the collected chunks → { rate, channels, pcm: base64 }.
+    const audioOut = (chunks) => {
+      if (!chunks.length) return null;
+      const ch = chunks[0].numberOfChannels, rate = chunks[0].sampleRate;
+      const total = chunks.reduce((n, b) => n + b.length, 0);
+      const pcm = new Int16Array(total * ch);
+      let o = 0;
+      for (const b of chunks) {
+        const data = Array.from({ length: ch }, (_, c) => b.getChannelData(c));
+        for (let i = 0; i < b.length; i++) for (let c = 0; c < ch; c++) pcm[o++] = Math.max(-32768, Math.min(32767, Math.round(data[c][i] * 32767)));
+      }
+      return { rate, channels: ch, pcm: u8ToB64(new Uint8Array(pcm.buffer)) };
+    };
+
+    // Recording: while Emu._rec is set, waits run at 1x and recTick() (called once
+    // per animation frame) collects frames into a ring buffer.
+    Emu._rec = null;
+    function recTick() {
+      const R = Emu._rec;
+      if (!R) return;
+      if (R.pending !== null) {
+        const d = readShot();
+        if (!d) return;
+        R.frames.push({ frame: R.pending, png: u8ToB64(d) });
+        if (R.frames.length > R.max) R.frames.shift();
+        R.pending = null;
+      }
+      const f = Emu.frameNum();
+      if (f !== R.last && (f - R.origin) % R.every === 0) { requestShot(); R.pending = f; R.last = f; }
+    }
+    Emu.recStart = (every = 1, max = 600) => {
+      Emu._rec = { every, max, frames: [], pending: null, last: null, origin: Emu.frameNum() };
+      Emu._audio = { chunks: [] };
+      recTick(); // request the current frame; it is collected once the loop runs
+    };
+    Emu.recStop = async () => {
+      const R = Emu._rec;
+      if (!R) return [];
+      // A request still queued (paused right after it): capture that frame exactly.
+      // captureScreen() adds it to the recording.
+      if (R.pending !== null) await captureScreen();
+      Emu._rec = null;
+      const A = Emu._audio;
+      Emu._audio = null;
+      // With a ring buffer, keep only the audio that goes with the kept frames
+      // (~1/60 s of samples per frame).
+      let chunks = A ? A.chunks : [];
+      if (chunks.length && R.frames.length) {
+        const spanFrames = R.frames[R.frames.length - 1].frame - R.frames[0].frame + R.every;
+        const want = Math.round(spanFrames * chunks[0].sampleRate / 60);
+        let have = 0, i = chunks.length;
+        while (i > 0 && have < want) have += chunks[--i].length;
+        chunks = chunks.slice(i);
+      }
+      return { frames: R.frames, audio: audioOut(chunks) };
+    };
+
     // Run until the clock reaches an absolute target, then pause. A wall-clock
     // timeout (scaled to the distance, so long 1x waits don't trip it) guards
     // against a stalled main loop.
@@ -130,7 +213,7 @@
       const timeoutMs = 30000 + (targetFrame - Emu.frameNum()) * (1000 / 60) * 2;
       const t0 = performance.now();
       let snap = null, snapFrame = 0;
-      if (Emu.fast && targetFrame - Emu.frameNum() > FF_MARGIN * 2) {
+      if (Emu.fast && !Emu._rec && targetFrame - Emu.frameNum() > FF_MARGIN * 2) {
         snapFrame = Emu.frameNum();
         snap = gm().getState();
         Emu.stats.ffWaits++;
@@ -156,6 +239,7 @@
           throw new Error(`waitFrames timeout: frame ${f} < target ${targetFrame}`);
         }
         await raf();
+        recTick();
       }
     }
 
@@ -213,15 +297,22 @@
     // we run it just long enough to capture, then restore the exact pre-capture state.
     async function captureScreen() {
       const snap = gm().getState(), f = Emu.frameNum();
+      if (Emu._rec && Emu._rec.pending === f) Emu._rec.pending = null; // superseded by this capture
+      requestShot();
       Emu.resume();
-      try { return u8ToB64(await gm().screenshot()); } // PNG -> base64
-      finally { Emu.pause(); await restore(snap, f); }
+      try {
+        let d;
+        while (!(d = readShot())) await raf();
+        const png = u8ToB64(d);
+        if (Emu._rec && Emu._rec.last === f && !Emu._rec.frames.some((x) => x.frame === f)) Emu._rec.frames.push({ frame: f, png });
+        return png;
+      } finally { Emu.pause(); await restore(snap, f); }
     }
     /** -> { png: base64, stale: bool }. stale = the picture for this exact state is
      *  unknown (e.g. right after loading an external save state) and the image is the
      *  last frame the core rendered; advance >= 1 frame for a true picture. */
     Emu.screenshot = async () => {
-      if (Emu._running) return { png: u8ToB64(await gm().screenshot()), stale: false };
+      if (Emu._running) { requestShot(); let d; while (!(d = readShot())) await raf(); return { png: u8ToB64(d), stale: false }; }
       if (Emu._screen) return { png: Emu._screen, stale: false };
       const stale = !Emu._fbValid;
       const png = await captureScreen();
@@ -321,7 +412,7 @@
       const t0 = performance.now(), timeoutMs = 30000 + maxFrames * (1000 / 60) * 2;
       let last = start, lastChange = Emu.frameNum();
       let lastFalse = null, lastFalseFrame = 0;
-      let fast = Emu.fast && !precise && !stable;
+      let fast = Emu.fast && !precise && !stable && !Emu._rec;
       const done = (met) => { setFF(false); Emu.pause(); Emu._target = Emu.frameNum(); Emu._advanced(); return { met, frame: Emu.frameNum() }; };
       Emu.resume();
       for (;;) {
@@ -347,6 +438,7 @@
         if (performance.now() - t0 > timeoutMs) { done(false); throw new Error(`waitFor timeout at frame ${f}`); }
         setFF(fast && limit - f > FF_MARGIN);
         await raf();
+        recTick();
       }
     };
 

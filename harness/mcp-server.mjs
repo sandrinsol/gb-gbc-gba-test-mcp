@@ -7,7 +7,7 @@
 //   play     load_rom, wait_frames, press, set_button, wait_until, reset
 //   look     screenshot, read_memory, read_cpu, read_sprites, view_vram, status
 //   change   write_memory, save_state, load_state, set_cheats, battery_save
-//   test     run_sequence, assert_golden, export_script, ab_compare
+//   test     run_sequence, assert_golden, export_script, ab_compare, record_video
 //   find     ram_search
 // The machine is paused between calls, so every read lands on an exact frame.
 //
@@ -29,6 +29,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { EmuHarness } from './driver.mjs';
 import { assertGolden, compare } from './assert.mjs';
 import { scalePng, contactSheet } from './png.mjs';
+import { saveVideo } from './recording.mjs';
 import { RamSearch, SEARCH_OPS, SEARCH_TYPES } from './ramsearch.mjs';
 import { runSteps, parseAddress, decodeValues, encodeValue, VALUE_TYPES } from './steps.mjs';
 import { gbaSprites, gbSprites, drawBoxes, gbaPalettes, gbPalettes, palettesPng, gbaTilesPng, gbTilesPng } from './video.mjs';
@@ -460,8 +461,10 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
       scale: Scale,
       outDir: z.string().optional().describe('also save shots + timeline.json'),
       maxImages: z.number().int().min(0).max(20).default(8),
+      video: z.object({ path: z.string(), onlyOnFail: z.boolean().default(true), seconds: z.number().positive().default(10) }).optional()
+        .describe('record the run (at 1x); by default only kept when a step fails'),
     },
-  }, async ({ steps, scale, outDir, maxImages }) => {
+  }, async ({ steps, scale, outDir, maxImages, video }) => {
     const out = outDir ? await writePath(outDir) : undefined;
     const bd = await baseDir();
     // Record each step as it completes (with absolute paths, so an exported script
@@ -471,7 +474,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
       for (const k of ['assert', 'loadStateFile', 'importSave']) if (typeof c[k] === 'string') c[k] = path.resolve(bd, c[k]);
       record(c);
     };
-    const res = await runSteps(emu, steps, { outDir: out, baseDir: bd, states, checkWrite: await writeGuard(), onStep });
+    const res = await runSteps(emu, steps, { outDir: out, baseDir: bd, states, checkWrite: await writeGuard(), onStep, video });
     const frame = await emu.frameNum();
     if (out) await writeFile(path.join(out, 'timeline.json'), JSON.stringify({ rom: romPath, pass: res.failures === 0, steps: res.timeline }, null, 2));
 
@@ -500,9 +503,28 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     });
     const summary = `${res.failures ? `FAIL (${res.failures})` : 'OK'}: ${steps.length} steps, frame ${frame}.` +
       (dropped ? ` ${dropped} image(s) not shown${out ? `; saved in ${out}` : ''}.` : '') +
+      (res.video ? ` Video: ${res.video}.` : '') +
       (lines.length ? `\n${lines.join('\n')}` : '');
     const r = result(summary, { pass: res.failures === 0, failures: res.failures, frame }, images);
     return res.failures ? { ...r, isError: true } : r;
+  });
+
+  tool('record_video', {
+    description: 'Play the next `frames` frames and save them as a video (.gif, .png animated, .webm, .mp4, or .wav for sound only). Frame-exact, with sound in .mp4/.webm when a full ffmpeg is installed. For people; to look yourself use run_sequence record.',
+    inputSchema: {
+      frames: z.number().int().positive().max(36000),
+      path: z.string(),
+      every: z.number().int().positive().default(1).describe('keep every Nth frame'),
+      scale: z.number().int().min(1).max(4).default(2),
+      audio: z.enum(['auto', 'on', 'off']).default('auto').describe('on: write a .wav beside formats without sound'),
+    },
+  }, async ({ frames, path: p, every, scale, audio }) => {
+    const file = await writePath(p);
+    const caps = await emu.record(frames, { every });
+    const r = await saveVideo(caps, file, { scale, every, audio, toJpeg: (pngs, k) => emu.toJpeg(pngs, k) });
+    record({ video: { frames, path: file, every, scale, audio } });
+    const frame = await emu.frameNum();
+    return result(`Saved ${caps.length} frames to ${file}${r.audio === 'muxed' ? ' with sound' : r.audio ? `; sound in ${r.audio}` : ''}. Frame ${frame}.`, { frame });
   });
 
   tool('assert_golden', {
