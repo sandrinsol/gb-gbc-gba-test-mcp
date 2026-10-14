@@ -19,7 +19,7 @@ paused between calls), **fully offline** (any external request is blocked and
 reported), and reads/writes **real RAM** out of save states — no core rebuild needed.
 
 **Contents:** [Setup](#setup-once) · [Use as an MCP server](#use-as-an-mcp-server) ·
-[Tools & prompts](#tools--prompts) · [Writing a test](#writing-a-test) · [API](#api) ·
+[Tools & prompts](#tools--prompts) · [Token budget](#token-budget) · [Writing a test](#writing-a-test) · [API](#api) ·
 [Screenshot timelines](#screenshot-timelines-ai-friendly) ·
 [Golden-frame diffing](#golden-frame-diffing) · [How it works](#how-it-works) ·
 [Determinism](#determinism-verified) · [Reading RAM](#reading-ram-gba-and-gbgbc) ·
@@ -62,6 +62,7 @@ resolved absolute path.
 | `GBTEST_CHROMIUM` | Use this Chromium/Chrome binary instead of Playwright's download. |
 | `UPDATE_GOLDENS=1` | Re-create goldens instead of comparing. |
 | `GBTEST_ALLOW_ANY_PATH=1` | Allow writing files outside the workspace root (see below). |
+| `GBTEST_TOOLS` | Expose a subset of tools: `core`, or a comma list (see Token budget). |
 
 **Writes stay in the workspace.** Files the tools create (screenshot saves, state
 files, goldens and diffs, `run_sequence` output, exported scripts and saves) must
@@ -124,25 +125,45 @@ Claude Code).
 | `wait_frames` | Advance N frames (60 ≈ 1 s). |
 | `press` | Tap one `button` or a combo `buttons: ["A","B"]` (hold / release frames). |
 | `set_button` | Hold/release button(s) without advancing time. |
-| `screenshot` | Current frame inline, **upscaled 3× by default** (`scale` 1–4) so it's legible; `save` writes the native PNG. |
+| `screenshot` | Current frame inline, **upscaled 2× by default** (`scale` 1–4); `save` writes the native PNG. |
 | `read_memory` | Read RAM. `address` may be a number or a hex string (`"0x03000010"`, `"$C000"`); typed `as` returns every value in the range. |
 | `write_memory` | Poke RAM on the current frame (`value`+`as` or `hex`); reports whether it stuck. |
 | `save_state` / `load_state` | Named snapshots; optional `path` saves/loads a file that survives restarts. |
 | `assert_golden` | Compare to a golden PNG (created on first run). On failure returns **current, golden and diff images inline**. |
 | `run_sequence` | Run a whole script of steps in **one call** (waits, taps, holds, shots, recordings as a contact sheet, RAM reads/writes/asserts, golden asserts) and get the timeline + images back. |
 | `wait_until` | Run until a **RAM condition** (`address` + `op` + `value`, or `changed`) or a **screen condition** (`changed`, or `stable` for N frames) holds, stopping on the first frame it does. Replaces wait-read-check loops. |
-| `ram_search_start` / `ram_search_filter` / `ram_search_results` | Cheat-search: find where the game keeps a value (eq / changed / increased / decreased / delta …) in a few calls. |
+| `ram_search` | Cheat-search: `action` `start` / `filter` / `list` — find where the game keeps a value (eq / changed / increased / decreased / delta …) in a few calls. |
 | `read_cpu` | CPU registers (GBA ARM7 / GB SM83) — tell "hung in a loop" from "running". |
 | `read_sprites` | Decoded sprite table (position, size, tile, palette, flips) + a screenshot with sprite boxes — find the player/enemies without a RAM search. |
 | `view_vram` | Tile graphics or all palettes as an image. |
 | `set_cheats` | GameShark / Action Replay / CodeBreaker (GBA), GameShark / Game Genie (GB). |
-| `export_save` / `import_save` | Battery saves (`.sav`): check what the game saved, or boot from a save. |
+| `battery_save` | Battery saves (`.sav`): `action` `export` (check what the game saved) or `import` (boot from a save). |
 | `export_script` | Everything done since `load_rom` as a replayable step script — exploratory play becomes a regression test. |
 | `ab_compare` | Run the same steps on two ROM builds side by side and diff the shots and RAM reads. |
-| `frame_number`, `reset`, `status` | Housekeeping. `reset` is the console's reset button: deterministic, keeps the battery save. |
+| `reset`, `status` | `reset` is the console's reset button (deterministic, keeps the battery save); `status` reports ROM, frame, held buttons, states, cheats. |
 
-Tools carry MCP annotations (`readOnlyHint` etc.) and structured output schemas.
-Calls are serialized, so a host issuing tools in parallel can't interleave them.
+Read-only tools carry `readOnlyHint`; results come as compact text plus a few
+structured fields (frame, pass/fail, counts). Calls are serialized, so a host
+issuing tools in parallel can't interleave them.
+
+### Token budget
+
+The host resends every tool definition with each request, and images are the
+largest results, so the server is built to be cheap:
+
+- **Definitions:** ~2,600 tokens for all 22 tools (terse descriptions, no output
+  schemas, schema boilerplate stripped). Set **`GBTEST_TOOLS=core`** to expose just
+  the 11 everyday tools (`load_rom wait_frames press set_button wait_until screenshot
+  read_memory write_memory run_sequence assert_golden status`, ~1,500 tokens), or a
+  comma list like `core,ram_search`.
+- **Images:** 2× by default (~205 tokens for a GBA frame; 1× is ~50, 3× ~460).
+- **Results:** each piece of data is sent once — sprite lists, RAM-search
+  candidates, the step timeline and exported scripts are compact text.
+- **Fewer calls:** one `run_sequence` replaces a chain of press/wait/screenshot
+  calls, and `wait_until` replaces wait-and-check loops. Every call resends the
+  conversation, so this saves the most in long sessions.
+
+`tests/mcp.mjs` fails if the full tool list grows past 3,000 tokens.
 **Resources:** `emu://screen` (current frame PNG) and `emu://status` (JSON).
 
 **Console support:** GBA (mgba) and GB/GBC (gambatte) — everything works for all
@@ -173,11 +194,11 @@ cores don't expose one; it would need custom builds of mgba/gambatte. `read_cpu`
 (Addresses and counts are illustrative.)
 
 ```
-ram_search_start  { "type": "u8", "value": 10 }        -> 812 candidates
+ram_search { "action": "start", "value": 10 }               -> 812 candidates
 (take a hit in game)
-ram_search_filter { "op": "eq", "value": 9 }            -> 3 candidates
+ram_search { "action": "filter", "op": "eq", "value": 9 }   -> 3 candidates
 (take another hit)
-ram_search_filter { "op": "delta", "value": -1 }        -> 1 candidate: 0x03001a4c = 8
+ram_search { "action": "filter", "op": "delta", "value": -1 } -> 1: 0x03001a4c iwram =8
 write_memory      { "address": "0x03001a4c", "value": 99 }   # verify on screen
 ```
 
@@ -364,7 +385,7 @@ const rg  = await emu.readRegions();              // { wram, vram, sram, hram, i
 
 Or via the MCP `read_memory` tool (`address`, `length`, `as: hex|u8|u16|u32|s8|s16|s32`).
 
-**Don't know the address?** `ramsearch.mjs` (MCP: `ram_search_*`) does a classic value
+**Don't know the address?** `ramsearch.mjs` (MCP: `ram_search`) does a classic value
 search over GBA EWRAM+IWRAM or GB WRAM (every CGB bank)+HRAM+cart RAM:
 
 ```js
