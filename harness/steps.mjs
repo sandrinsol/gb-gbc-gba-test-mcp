@@ -73,10 +73,12 @@ const asList = (b) => (Array.isArray(b) ? b : [b]);
  * @param {Map<string, Buffer>} [opts.states]  named states (shared with the caller)
  * @param {(msg: string) => void} [opts.log]
  * @param {(absPath: string) => void} [opts.checkWrite]  throws to refuse writing there
+ * @param {(step: Record<string, any>) => void} [opts.onStep]  called after each step
+ *   completes (so a caller can record what actually ran, even if a later step throws)
  * @returns {Promise<{ timeline: any[], shots: Array<{name: string, frame: number, png: Buffer, file?: string}>,
  *   records: Array<{prefix: string, frames: number[], pngs: Buffer[], files: string[]}>, failures: number }>}
  */
-export async function runSteps(emu, steps, { outDir, baseDir = process.cwd(), states = new Map(), log = () => {}, checkWrite = () => {} } = {}) {
+export async function runSteps(emu, steps, { outDir, baseDir = process.cwd(), states = new Map(), log = () => {}, checkWrite = () => {}, onStep = () => {} } = {}) {
   if (!Array.isArray(steps)) throw new Error('steps must be an array');
   if (outDir) { checkWrite(outDir); await mkdir(outDir, { recursive: true }); }
   const timeline = [], shots = [], records = [];
@@ -202,6 +204,7 @@ export async function runSteps(emu, steps, { outDir, baseDir = process.cwd(), st
       throw new Error(`step ${i}: unknown step ${JSON.stringify(step)}`);
     }
     timeline.push(entry);
+    onStep(step);
   }
   return { timeline, shots, records, failures };
 }

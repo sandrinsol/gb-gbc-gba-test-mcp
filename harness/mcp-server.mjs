@@ -3,9 +3,17 @@
 //
 // Exposes the emulator to any MCP host (Claude Code, Claude Desktop, Cursor, ...)
 // as tools an AI agent can call to test the GB/GBC/GBA games it builds — no
-// third-party emulator program. screenshot returns the frame as an inline image so
-// the agent literally sees the game; read_memory reads real RAM out of a save state;
-// ram_search finds where a value lives; run_sequence plays a whole script per call.
+// third-party emulator program. Tools, in groups:
+//   play     load_rom, wait_frames, press, set_button, wait_until, reset
+//   look     screenshot, read_memory, read_cpu, read_sprites, view_vram, status
+//   change   write_memory, save_state, load_state, set_cheats, battery_save
+//   test     run_sequence, assert_golden, export_script, ab_compare
+//   find     ram_search
+// The machine is paused between calls, so every read lands on an exact frame.
+//
+// Token budget: every tool definition is resent with each request, so they are
+// kept terse and GBTEST_TOOLS can expose a subset (see toolFilter). Results put
+// their data in one place, and images default to 2x.
 //
 // Run: node mcp-server.mjs   (stdio transport)
 // Library/tests: import { createServer } from './mcp-server.mjs'
@@ -31,10 +39,34 @@ const VERSION = JSON.parse(readFileSync(path.join(__dirname, 'package.json'), 'u
 
 const BUTTONS = ['A', 'B', 'L', 'R', 'START', 'SELECT', 'UP', 'DOWN', 'LEFT', 'RIGHT'];
 const Button = z.enum(BUTTONS);
-const Address = z.union([z.number().int().nonnegative(), z.string()])
-  .describe('Bus address: a number, or a hex string like "0x03000010" / "$C000" (JSON has no hex literals)');
-const Scale = z.number().int().min(1).max(4).default(3)
-  .describe('Integer upscale (nearest-neighbour). 3 = 720x480 for GBA, 480x432 for GB');
+const Address = z.union([z.number().int().nonnegative(), z.string()]).describe('number or hex string "0x0300..."');
+const Scale = z.number().int().min(1).max(4).default(2).describe('image upscale');
+
+/** Tools in the "core" set: enough to play, look, check and script a game. */
+export const CORE_TOOLS = ['load_rom', 'wait_frames', 'press', 'set_button', 'wait_until', 'screenshot',
+  'read_memory', 'write_memory', 'run_sequence', 'assert_golden', 'status'];
+
+/** Drop JSON-schema noise that costs tokens but tells a model nothing: the
+ *  $schema URL and the ±2^53 bounds zod puts on every integer. */
+function slimSchema(node) {
+  if (Array.isArray(node)) return node.map(slimSchema);
+  if (!node || typeof node !== 'object') return node;
+  const out = {};
+  for (const [k, v] of Object.entries(node)) {
+    if (k === '$schema') continue;
+    if ((k === 'minimum' || k === 'maximum') && Math.abs(v) === Number.MAX_SAFE_INTEGER) continue;
+    out[k] = slimSchema(v);
+  }
+  return out;
+}
+
+/** Which tools to register, from GBTEST_TOOLS (or the `tools` option): unset or
+ *  "all" = every tool; otherwise a comma list of tool names and/or "core". */
+export function toolFilter(spec) {
+  if (!spec || spec.trim() === 'all') return () => true;
+  const want = new Set(spec.split(',').map((x) => x.trim()).filter(Boolean).flatMap((x) => (x === 'core' ? CORE_TOOLS : [x])));
+  return (name) => want.has(name);
+}
 
 const hex = (n) => '0x' + (n >>> 0).toString(16);
 const hexBytes = (buf) => buf.toString('hex').replace(/(..)/g, '$1 ').trim();
@@ -45,8 +77,9 @@ const png = (buf) => ({ type: 'image', data: buf.toString('base64'), mimeType: '
  *  - root: base dir for relative paths (else $GBTEST_ROOT, the client's first
  *    file:// root, or the process cwd)
  *  - fast: default fast-forward setting for load_rom
- *  @param {{ root?: string, fast?: boolean }} [opts] */
-export function createServer({ root = undefined, fast = true } = {}) {
+ *  - tools: which tools to expose (else $GBTEST_TOOLS; see toolFilter)
+ *  @param {{ root?: string, fast?: boolean, tools?: string }} [opts] */
+export function createServer({ root = undefined, fast = true, tools = undefined } = {}) {
   // ---- Session (one ROM at a time) ----
   let emu = null;
   let romName = null, romPath = null;
@@ -103,14 +136,20 @@ export function createServer({ root = undefined, fast = true } = {}) {
   function requireRom() {
     if (!emu) throw new Error('No ROM loaded. Call load_rom first.');
   }
+  // Results carry their data ONCE: lists and dumps go in the text (what the model
+  // reads); structuredContent holds only small scalar fields for programmatic use.
   const result = (text, structured, extra = []) => ({
     content: [{ type: 'text', text }, ...extra],
     ...(structured ? { structuredContent: structured } : {}),
   });
   const errText = (s) => ({ content: [{ type: 'text', text: s }], isError: true });
 
+  // Which tools to expose (each one's definition is resent with every request).
+  const enabled = toolFilter(tools ?? process.env.GBTEST_TOOLS);
+
   /** Register a tool whose handler runs serialized and turns throws into tool errors. */
   function tool(name, config, handler, { needsRom = true } = {}) {
+    if (!enabled(name)) return;
     server.registerTool(name, config, serial(async (args, extra) => {
       try {
         if (needsRom) requireRom();
@@ -121,20 +160,21 @@ export function createServer({ root = undefined, fast = true } = {}) {
     }));
   }
 
-  const RO = { readOnlyHint: true, openWorldHint: false };
-  const ACT = { readOnlyHint: false, destructiveHint: false, openWorldHint: false };
-  const FrameOut = { frame: z.number().int() };
+  const RO = { readOnlyHint: true };
+  const buttonsOf = ({ button, buttons }) => {
+    const list = [...(buttons ?? []), ...(button ? [button] : [])];
+    if (!list.length) throw new Error('give `button` or `buttons`');
+    return [...new Set(list)];
+  };
+  const Rect = z.object({ x: z.number().int(), y: z.number().int(), w: z.number().int(), h: z.number().int() });
 
-  // ---- Tools ----
+  // ---- Play ----
   tool('load_rom', {
-    title: 'Load ROM',
-    description: 'Boot a GBA/GB/GBC ROM (.gba/.gb/.gbc/.zip) in the headless emulator, replacing any current ROM (saved states and RAM searches are cleared). The system is auto-detected from the extension. Relative paths resolve against the workspace root. The emulator is paused between calls and only runs inside waits, so every read is frame-exact.',
+    description: 'Boot a .gba/.gb/.gbc ROM (or a .zip holding one). Starts fresh: states, cheats, RAM search and recording are cleared. The emulator is paused between calls, so reads are frame-exact.',
     inputSchema: {
-      rom: z.string().describe('Path to the ROM file'),
-      fast: z.boolean().default(fast).describe('Fast-forward long waits (results are bit-identical to real-time)'),
+      rom: z.string(),
+      fast: z.boolean().default(fast).describe('Fast-forward long waits (results identical)'),
     },
-    outputSchema: { rom: z.string(), system: z.string(), width: z.number(), height: z.number(), frame: z.number() },
-    annotations: ACT,
   }, async ({ rom, fast: ff }) => {
     if (emu) { await emu.close().catch(() => {}); emu = null; }
     states.clear(); search = null; rec = [];
@@ -143,120 +183,195 @@ export function createServer({ root = undefined, fast = true } = {}) {
     romName = path.basename(abs); romPath = abs;
     const dims = await emu.videoDimensions();
     const frame = await emu.frameNum();
-    return result(`Loaded ${romName} (${abs}) as ${sysName(emu.system)}. Video ${dims.w}x${dims.h}. Paused at frame ${frame}.`,
-      { rom: abs, system: sysName(emu.system), width: dims.w, height: dims.h, frame });
+    return result(`Loaded ${abs} as ${sysName(emu.system)} ${dims.w}x${dims.h}, frame ${frame}.`,
+      { system: sysName(emu.system), frame });
   }, { needsRom: false });
 
   tool('wait_frames', {
-    title: 'Wait frames',
-    description: 'Advance the emulator by N emulated frames (deterministic; ~60 frames = 1 second). Held buttons stay held.',
-    inputSchema: { frames: z.number().int().positive().describe('Number of emulated frames to advance') },
-    outputSchema: FrameOut,
-    annotations: ACT,
+    description: 'Advance N frames (60 = 1 s). Held buttons stay held.',
+    inputSchema: { frames: z.number().int().positive() },
   }, async ({ frames }) => {
     await emu.waitFrames(frames);
     record({ wait: frames });
     const frame = await emu.frameNum();
-    return result(`Advanced to frame ${frame}.`, { frame });
+    return result(`Frame ${frame}.`, { frame });
   });
 
-  const buttonsOf = ({ button, buttons }) => {
-    const list = [...(buttons ?? []), ...(button ? [button] : [])];
-    if (!list.length) throw new Error('give `button` or `buttons`');
-    return [...new Set(list)];
-  };
-
   tool('press', {
-    title: 'Press button(s)',
-    description: 'Press one button or a combo together (e.g. buttons=["A","B"]): hold for `hold` frames, then release and settle for `release` frames.',
+    description: 'Tap one button or a combo: hold `hold` frames, release, wait `release` frames.',
     inputSchema: {
       button: Button.optional(),
-      buttons: z.array(Button).optional().describe('Several buttons pressed at the same time'),
+      buttons: z.array(Button).optional(),
       hold: z.number().int().positive().default(4),
       release: z.number().int().nonnegative().default(4),
     },
-    outputSchema: FrameOut,
-    annotations: ACT,
   }, async (args) => {
     const list = buttonsOf(args);
     await emu.tap(list, args.hold, args.release);
     record({ tap: list.length === 1 ? list[0] : list, hold: args.hold, release: args.release });
     const frame = await emu.frameNum();
-    return result(`Pressed ${list.join('+')} (hold ${args.hold}f). Now at frame ${frame}.`, { frame });
+    return result(`Pressed ${list.join('+')}. Frame ${frame}.`, { frame });
   });
 
   tool('set_button', {
-    title: 'Hold / release button(s)',
-    description: 'Hold or release one or more buttons without advancing time (for long holds, combos, precise timing). Follow with wait_frames.',
+    description: 'Hold or release button(s) without advancing time.',
     inputSchema: { button: Button.optional(), buttons: z.array(Button).optional(), pressed: z.boolean() },
-    outputSchema: { held: z.array(z.string()) },
-    annotations: ACT,
   }, async (args) => {
     const list = buttonsOf(args);
     await emu.setButtons(list, args.pressed);
     record(args.pressed ? { press: list } : { release: list });
     const held = await emu.heldButtons();
-    return result(`${list.join('+')} ${args.pressed ? 'held' : 'released'}. Held now: ${held.join(', ') || 'none'}.`, { held });
+    return result(`Held: ${held.join(', ') || 'none'}.`);
   });
 
-  tool('screenshot', {
-    title: 'Screenshot',
-    description: 'Capture the current frame as a PNG (returned inline so you can see it). Upscaled 3x by default so small console frames are legible. Optionally also save the native-resolution PNG.',
+  tool('wait_until', {
+    description: 'Run until a RAM condition (address+op+value) or a screen condition ("changed", or "stable" for `frames` frames) holds; stops on the first such frame. Use instead of wait/read loops. precise=true checks every frame at 1x.',
     inputSchema: {
+      address: Address.optional(),
+      as: z.enum(Object.keys(VALUE_TYPES)).default('u8'),
+      op: z.enum(['eq', 'ne', 'gt', 'lt', 'gte', 'lte', 'changed']).default('eq'),
+      value: z.number().int().optional(),
+      screen: z.enum(['changed', 'stable']).optional(),
+      frames: z.number().int().positive().default(30),
+      maxFrames: z.number().int().positive().max(216000).default(600),
+      precise: z.boolean().default(false),
+      screenshot: z.boolean().default(false),
       scale: Scale,
-      save: z.string().optional().describe('Also write the native-resolution PNG to this path'),
     },
-    outputSchema: { frame: z.number(), width: z.number(), height: z.number(), stale: z.boolean(), saved: z.string().optional() },
+  }, async ({ address, as, op, value, screen, frames, maxFrames, precise, screenshot, scale }) => {
+    let cond;
+    if (screen) cond = { screen, frames };
+    else if (address !== undefined) cond = { address: parseAddress(address), as, op, value };
+    else return errText('give `address` (+ op/value) or `screen`');
+    const before = await emu.waitTarget(), f0 = await emu.frameNum();
+    const r = await emu.waitFor(cond, { maxFrames, precise });
+    record({ wait: r.frame - before });
+    const text = r.met ? `Met at frame ${r.frame} (+${r.frame - f0}).` : `Not met within ${maxFrames} frames; frame ${r.frame}.`;
+    const extra = screenshot ? [png(scalePng(await emu.screenshot(), scale))] : [];
+    return result(text, { met: r.met, frame: r.frame, waited: r.frame - f0 }, extra);
+  });
+
+  tool('reset', {
+    description: 'Reset button: battery save and cheats kept, frame restarts at 1.',
+    inputSchema: {},
+  }, async () => {
+    await emu.restart();
+    record({ reset: true });
+    return result(`Reset. Frame ${await emu.frameNum()}.`);
+  });
+
+  // ---- Look ----
+  tool('screenshot', {
+    description: 'Current frame as an image. `save` also writes the native PNG.',
+    inputSchema: { scale: Scale, save: z.string().optional() },
     annotations: RO,
   }, async ({ scale, save }) => {
     const buf = await emu.screenshot();
     const stale = emu.lastScreenshotStale;
-    const d = await emu.videoDimensions();
     const frame = await emu.frameNum();
     let saved;
-    record({ shot: `f${frame}` });
     if (save) {
       saved = await writePath(save);
       await mkdir(path.dirname(saved), { recursive: true });
       await writeFile(saved, buf);
     }
-    const warn = stale ? ' NOTE: this state was loaded from a file made outside this session, so its picture is unknown — this is the last frame rendered before the load; wait_frames 1 to see the real screen.' : '';
-    return result(`Frame ${frame} of ${romName} (${d.w}x${d.h}, shown at ${scale}x)${saved ? `; saved ${saved}` : ''}.${warn}`,
-      { frame, width: d.w, height: d.h, stale, ...(saved ? { saved } : {}) }, [png(scalePng(buf, scale))]);
+    record({ shot: `f${frame}` });
+    const warn = stale ? ' STALE: state from another session; wait_frames 1 for the real picture.' : '';
+    return result(`Frame ${frame}${saved ? `, saved ${saved}` : ''}.${warn}`, { frame, stale }, [png(scalePng(buf, scale))]);
   });
 
   tool('read_memory', {
-    title: 'Read RAM',
-    description: 'Read RAM at a bus address on the current frame. GBA: 0x02000000 (EWRAM), 0x03000000 (IWRAM), 0x04000000 (IO). GB/GBC: 0xC000 (WRAM), 0xFF80 (HRAM), 0xFE00 (OAM), 0xFF00 (IO), 0xA000 (cart RAM). With a typed `as`, returns every value in the range (length bytes / width).',
+    description: 'Read RAM. GBA: 0x02000000 EWRAM, 0x03000000 IWRAM, 0x04000000 IO. GB: 0xC000 WRAM, 0xFF80 HRAM, 0xFE00 OAM, 0xFF00 IO, 0xA000 cart RAM. A typed `as` decodes every value.',
     inputSchema: {
       address: Address,
-      length: z.number().int().positive().max(4096).default(4).describe('Bytes to read'),
-      as: z.enum(['hex', ...Object.keys(VALUE_TYPES)]).default('hex').describe('Interpretation (little-endian)'),
+      length: z.number().int().positive().max(4096).default(4).describe('bytes'),
+      as: z.enum(['hex', ...Object.keys(VALUE_TYPES)]).default('hex'),
     },
-    outputSchema: { address: z.number(), hex: z.string(), values: z.array(z.number()).optional() },
     annotations: RO,
   }, async ({ address, length, as }) => {
     const addr = parseAddress(address);
-    if (as !== 'hex') length = Math.max(length - (length % VALUE_TYPES[as][0]), VALUE_TYPES[as][0]);
-    const buf = await emu.readMemory(addr, length);
-    const h = hexBytes(buf);
-    if (as === 'hex') return result(`@${hex(addr)} [${length}B]: ${h}`, { address: addr, hex: h });
-    const values = decodeValues(buf, as);
-    const shown = values.length === 1 ? `${values[0]} (${hex(values[0])})` : `[${values.join(', ')}]`;
-    return result(`@${hex(addr)} ${as}=${shown} raw: ${h}`, { address: addr, hex: h, values });
+    if (as === 'hex') return result(`${hex(addr)}: ${hexBytes(await emu.readMemory(addr, length))}`);
+    const w = VALUE_TYPES[as][0];
+    const values = decodeValues(await emu.readMemory(addr, Math.max(length - (length % w), w)), as);
+    return result(`${hex(addr)} ${as}: ${values.length === 1 ? `${values[0]} (${hex(values[0])})` : values.join(', ')}`, { values });
   });
 
+  tool('read_cpu', {
+    description: 'CPU registers. A pc that stays put across waits means a hang.',
+    inputSchema: {},
+    annotations: RO,
+  }, async () => {
+    const c = await emu.readCpu();
+    const h4 = (n) => (n >>> 0).toString(16).padStart(8, '0'), h2 = (n) => n.toString(16).padStart(4, '0'), h1 = (n) => n.toString(16).padStart(2, '0');
+    const fl = (keys) => keys.filter((k) => c.flags[k]).join('').toUpperCase() || '-';
+    const text = emu.system === 'gba'
+      ? `pc=${h4(c.pc)} exec=${h4(c.executing)} ${c.thumb ? 'thumb' : 'arm'} ${c.mode} sp=${h4(c.sp)} lr=${h4(c.lr)} cpsr=${h4(c.cpsr)} ${fl(['n', 'z', 'c', 'v'])}${c.irqDisabled ? ' irq-off' : ''}\n` +
+        c.r.map((v, i) => `r${i}=${h4(v)}`).join(' ')
+      : `pc=${h2(c.pc)} sp=${h2(c.sp)} af=${h1(c.a)}${h1(c.f)} bc=${h1(c.b)}${h1(c.c)} de=${h1(c.d)}${h1(c.e)} hl=${h1(c.h)}${h1(c.l)} ${fl(['z', 'n', 'h', 'c'])} ime=${c.ime ? 1 : 0}${c.halted ? ' halted' : ''}`;
+    return result(`Frame ${await emu.frameNum()}: ${text}`, { pc: c.pc });
+  });
+
+  tool('read_sprites', {
+    description: 'On-screen sprites as "#index x,y wxh tile palette [flags]" plus a screenshot with them outlined (same order).',
+    inputSchema: {
+      all: z.boolean().default(false).describe('include off-screen/hidden'),
+      overlay: z.boolean().default(true),
+      scale: Scale,
+    },
+    annotations: RO,
+  }, async ({ all, overlay, scale }) => {
+    const r = await emu.readRegions();
+    const list = emu.system === 'gba' ? gbaSprites(r) : gbSprites(r, { cgb: !!r.isCgbWram });
+    const visible = list.filter((s) => s.onScreen);
+    const shown = all ? list : visible;
+    // flags: h/v = flipped, a = affine, x = off-screen or hidden
+    const line = (s) => {
+      const f = `${s.hflip ? 'h' : ''}${s.vflip ? 'v' : ''}${s.affine ? 'a' : ''}${s.onScreen ? '' : 'x'}`;
+      return `#${s.index} ${s.x},${s.y} ${s.w}x${s.h} t${s.tile} p${s.palette}${f ? ' ' + f : ''}`;
+    };
+    const extra = overlay ? [png(drawBoxes(await emu.screenshot(), visible, scale))] : [];
+    return result(`${visible.length}/${list.length} on screen, frame ${await emu.frameNum()}.${shown.length ? '\n' + shown.map(line).join('\n') : ''}`,
+      { onScreen: visible.length }, extra);
+  });
+
+  tool('view_vram', {
+    description: 'Image of tile graphics (GBA: region bg/obj, palette bank, bpp8; GB: bank, BG palette) or of all palettes.',
+    inputSchema: {
+      what: z.enum(['tiles', 'palettes']).default('tiles'),
+      region: z.enum(['bg', 'obj']).default('bg'),
+      palette: z.number().int().min(0).max(15).default(0),
+      bpp8: z.boolean().default(false),
+      bank: z.number().int().min(0).max(1).default(0),
+      scale: Scale,
+    },
+    annotations: RO,
+  }, async ({ what, region, palette, bpp8, bank, scale }) => {
+    const r = await emu.readRegions();
+    const cgb = !!r.isCgbWram;
+    let img, desc;
+    if (what === 'palettes') {
+      img = palettesPng(emu.system === 'gba' ? gbaPalettes(r) : gbPalettes(r, { cgb }));
+      desc = emu.system === 'gba' ? '16 BG then 16 OBJ rows of 16 colours' : (cgb ? '8 BG then 8 OBJ palettes' : 'BGP, OBP0, OBP1');
+    } else if (emu.system === 'gba') {
+      img = gbaTilesPng(r, { region, palette, bpp8 });
+      desc = `${region} tiles ${bpp8 ? '8bpp' : `4bpp pal ${palette}`}, 32/row`;
+    } else {
+      if (bank === 1 && r.vram.length < 0x4000) return errText('VRAM bank 1 only exists on GBC');
+      img = gbTilesPng(r, { bank, palette, cgb });
+      desc = `tiles 0x8000-0x97FF bank ${bank}, 16/row`;
+    }
+    return result(`${desc}, frame ${await emu.frameNum()}.`, undefined, [png(scalePng(img, scale))]);
+  });
+
+  // ---- Change ----
   tool('write_memory', {
-    title: 'Write RAM',
-    description: 'Write RAM at a bus address on the current frame to SET UP state (e.g. HP=1) without playing to it. Give `value`+`as`, or raw `hex` bytes. The game may overwrite values it recomputes every frame; the result says whether the value is in RAM after the write.',
+    description: 'Write RAM on the current frame (value+as, or hex bytes). Says if it did not stick.',
     inputSchema: {
       address: Address,
-      value: z.number().int().optional().describe('Integer value to write (used with `as`)'),
-      as: z.enum(['u8', 'u16', 'u32']).default('u8').describe('Width (little-endian) for `value`'),
-      hex: z.string().optional().describe('Alternative: raw bytes as hex, e.g. "deadbeef" (overrides value)'),
+      value: z.number().int().optional(),
+      as: z.enum(['u8', 'u16', 'u32']).default('u8'),
+      hex: z.string().optional().describe('raw bytes, e.g. "deadbeef"'),
     },
-    outputSchema: { address: z.number(), written: z.string(), readBack: z.string(), stuck: z.boolean() },
-    annotations: ACT,
   }, async ({ address, value, as, hex: hx }) => {
     const addr = parseAddress(address);
     let bytes;
@@ -271,21 +386,13 @@ export function createServer({ root = undefined, fast = true } = {}) {
     }
     const stuck = await emu.writeMemory(addr, bytes);
     record({ write: hex(addr), hex: bytes.toString('hex') });
-    const back = await emu.readMemory(addr, bytes.length);
-    const text = `Wrote ${bytes.length}B @${hex(addr)}; read back: ${hexBytes(back)}` +
-      (stuck ? '' : ' — WARNING: the value did not stick (not RAM-backed, or the game overwrote it).');
-    return result(text, { address: addr, written: hexBytes(bytes), readBack: hexBytes(back), stuck });
+    if (stuck) return result(`Wrote ${bytes.length}B at ${hex(addr)}.`, { stuck });
+    return result(`Wrote ${bytes.length}B at ${hex(addr)} but it did not stick (not RAM, or overwritten); now: ${hexBytes(await emu.readMemory(addr, bytes.length))}.`, { stuck });
   });
 
   tool('save_state', {
-    title: 'Save state',
-    description: 'Snapshot the full machine under a name you can restore later. With `path`, also write it to disk so it survives load_rom / server restarts (reload with load_state path=...).',
-    inputSchema: {
-      id: z.string().default('default'),
-      path: z.string().optional().describe('Also save the state to this file'),
-    },
-    outputSchema: { id: z.string(), bytes: z.number(), frame: z.number(), path: z.string().optional() },
-    annotations: ACT,
+    description: 'Snapshot under `id`; `path` also writes a file.',
+    inputSchema: { id: z.string().default('default'), path: z.string().optional() },
   }, async ({ id, path: p }) => {
     const st = await emu.saveState();
     states.set(id, st);
@@ -296,87 +403,75 @@ export function createServer({ root = undefined, fast = true } = {}) {
       await mkdir(path.dirname(file), { recursive: true });
       await writeFile(file, st);
     }
-    const frame = await emu.frameNum();
-    return result(`Saved state "${id}" (${st.length} bytes) at frame ${frame}${file ? ` -> ${file}` : ''}.`,
-      { id, bytes: st.length, frame, ...(file ? { path: file } : {}) });
+    return result(`Saved "${id}" at frame ${await emu.frameNum()}${file ? ` to ${file}` : ''}.`);
   });
 
   tool('load_state', {
-    title: 'Load state',
-    description: 'Restore a saved state by name, or from a file written by save_state (`path`). The state must come from the same ROM/console.',
-    inputSchema: {
-      id: z.string().default('default'),
-      path: z.string().optional().describe('Load from this file instead of a named in-memory state'),
-    },
-    outputSchema: FrameOut,
-    annotations: ACT,
+    description: 'Restore state `id`, or a state file (`path`).',
+    inputSchema: { id: z.string().default('default'), path: z.string().optional() },
   }, async ({ id, path: p }) => {
     let st;
     if (p) {
       st = await readFile(await resolvePath(p));
-      states.set(id, st);
     } else {
       st = states.get(id);
-      if (!st) return errText(`No saved state "${id}". Saved: ${[...states.keys()].join(', ') || 'none'}.`);
+      if (!st) return errText(`No state "${id}". Saved: ${[...states.keys()].join(', ') || 'none'}.`);
     }
     await emu.loadState(st);
     record(p ? { loadStateFile: await resolvePath(p) } : { loadState: id });
     const frame = await emu.frameNum();
-    return result(`Restored state ${p ? `from ${p}` : `"${id}"`}. Frame ${frame}.`, { frame });
+    return result(`Restored. Frame ${frame}.`, { frame });
   });
 
-  tool('assert_golden', {
-    title: 'Assert golden frame',
-    description: 'Compare the current frame to a stored golden PNG (created on first call). Fails if more than `threshold` of pixels differ. `ignore` masks rectangles that legitimately change (clocks, timers). On failure, returns the current frame, the golden and a red-highlighted diff inline.',
-    inputSchema: {
-      golden: z.string().describe('Path to the golden PNG (created if missing)'),
-      threshold: z.number().min(0).max(1).default(0.02).describe('Max fraction of differing pixels'),
-      tolerance: z.number().int().min(0).max(255).default(16).describe('Per-channel delta that counts as different'),
-      ignore: z.array(z.object({ x: z.number().int(), y: z.number().int(), w: z.number().int(), h: z.number().int() })).default([])
-        .describe('Rectangles (native pixels) to leave out, e.g. a clock: [{"x":200,"y":0,"w":40,"h":16}]'),
-      scale: Scale.default(2),
-    },
-    outputSchema: { pass: z.boolean(), created: z.boolean(), fraction: z.number(), golden: z.string(), diff: z.string().optional() },
-    annotations: ACT,
-  }, async ({ golden, threshold, tolerance, ignore, scale }) => {
-    const shot = await emu.screenshot();
-    const goldenPath = await writePath(golden);
-    const res = await assertGolden(shot, goldenPath, { threshold, tolerance, ignore });
-    record({ assert: goldenPath, threshold, tolerance, ...(ignore.length ? { ignore } : {}) });
-    const out = { pass: res.pass, created: !!res.created, fraction: res.fraction ?? 0, golden: res.goldenPath, ...(res.diffPath ? { diff: res.diffPath } : {}) };
-    if (res.created) return result(`Golden created at ${res.goldenPath} (baseline saved). Check it looks right:`, out, [png(scalePng(shot, scale))]);
-    const pct = (res.fraction * 100).toFixed(2);
-    if (res.pass) return result(`PASS: ${pct}% pixels differ (<= ${threshold * 100}%).`, out);
-    const why = res.mismatchDimensions ? 'frame size differs from the golden' : `${pct}% pixels differ (> ${threshold * 100}%)`;
-    const images = [{ type: 'text', text: 'Current frame:' }, png(scalePng(shot, scale)),
-      { type: 'text', text: 'Golden:' }, png(scalePng(await readFile(res.goldenPath), scale))];
-    if (res.diffPng) images.push({ type: 'text', text: 'Diff (red = different):' }, png(scalePng(res.diffPng, scale)));
-    return { ...result(`FAIL: ${why}.${res.diffPath ? ` Diff image: ${res.diffPath}` : ''}`, out, images), isError: true };
+  tool('set_cheats', {
+    description: 'Replace cheat codes ([] clears). GBA: GameShark/Action Replay/CodeBreaker. GB: GameShark 01VVLLHH (applied at VBlank) or Game Genie.',
+    inputSchema: { codes: z.array(z.string()) },
+  }, async ({ codes }) => {
+    await emu.setCheats(codes);
+    record({ cheats: codes });
+    return result(codes.length ? `${codes.length} cheat(s) active.` : 'Cheats cleared.');
   });
 
+  tool('battery_save', {
+    description: 'Battery save (.sav): action "export" writes it to `path`; "import" loads `path` and resets so the game boots with it (reset:false to skip).',
+    inputSchema: { action: z.enum(['export', 'import']), path: z.string(), reset: z.boolean().default(true) },
+  }, async ({ action, path: p, reset }) => {
+    if (action === 'export') {
+      const data = await emu.readSaveData();
+      if (!data) return errText('This game has no battery save.');
+      const file = await writePath(p);
+      await mkdir(path.dirname(file), { recursive: true });
+      await writeFile(file, data);
+      return result(`Exported ${data.length}B to ${file}.`, { bytes: data.length });
+    }
+    const file = await resolvePath(p);
+    const data = await readFile(file);
+    await emu.writeSaveData(data, { reset });
+    record({ importSave: file, reset });
+    const frame = await emu.frameNum();
+    return result(`Imported ${data.length}B${reset ? '; reset' : ''}. Frame ${frame}.`, { bytes: data.length, frame });
+  });
+
+  // ---- Test ----
   tool('run_sequence', {
-    title: 'Run input sequence',
-    description: `Run a whole script of steps in ONE call (instead of many press/wait/screenshot calls) and get back a timeline plus the screenshots it took. Steps (one action key each):
-{"wait":60} | {"tap":"A"} or {"tap":["A","B"],"hold":4,"release":4} | {"press":"RIGHT"} / {"release":"RIGHT"} | {"hold":"RIGHT","frames":30} | {"waitUntil":{"address":"0xC000","op":"eq","value":3},"maxFrames":600} or {"waitUntil":{"screen":"stable","frames":30}} | {"shot":"name"} | {"record":{"frames":120,"every":20,"prefix":"walk"}} (returned as one contact-sheet image) | {"saveState":"cp"} / {"loadState":"cp"} / {"loadStateFile":"x.state"} | {"read":"0x03000010","as":"u16","name":"hp"} | {"write":"0x03000010","value":1,"as":"u8"} | {"assertRam":"0x03000010","as":"u16","equals":3} (or "min"/"max") | {"assert":"goldens/x.png","threshold":0.02,"ignore":[{"x":0,"y":0,"w":40,"h":8}]} | {"reset":true} | {"cheats":["..."]} | {"importSave":"x.sav"}.
-States saved here are shared with save_state/load_state.`,
+    description: `Run many steps in ONE call (cheaper than separate calls). Steps: {"wait":N} {"tap":"A"|["A","B"],"hold":4,"release":4} {"press"|"release":btn} {"hold":btn,"frames":N} {"waitUntil":{"address","op","value"}|{"screen":"changed"|"stable"},"maxFrames":N} {"shot":name} {"record":{"frames","every"}} {"saveState"|"loadState":id} {"loadStateFile":path} {"read":addr,"as"} {"write":addr,"value"|"hex"} {"assertRam":addr,"as","equals"|"min"|"max"} {"assert":png,"threshold","ignore"} {"reset":true} {"cheats":[..]} {"importSave":path}`,
     inputSchema: {
-      steps: z.array(z.record(z.string(), z.any())).min(1).describe('Steps to run in order'),
-      scale: Scale.default(2),
-      outDir: z.string().optional().describe('Also write every screenshot + timeline.json here'),
-      maxImages: z.number().int().min(0).max(20).default(8).describe('Max images returned inline (the rest are listed only)'),
+      steps: z.array(z.record(z.string(), z.any())).min(1),
+      scale: Scale,
+      outDir: z.string().optional().describe('also save shots + timeline.json'),
+      maxImages: z.number().int().min(0).max(20).default(8),
     },
-    outputSchema: { pass: z.boolean(), failures: z.number(), frame: z.number(), timeline: z.array(z.record(z.string(), z.any())) },
-    annotations: ACT,
   }, async ({ steps, scale, outDir, maxImages }) => {
     const out = outDir ? await writePath(outDir) : undefined;
     const bd = await baseDir();
-    const res = await runSteps(emu, steps, { outDir: out, baseDir: bd, states, checkWrite: await writeGuard() });
-    // Record with absolute paths so an exported script replays from anywhere.
-    for (const st of steps) {
+    // Record each step as it completes (with absolute paths, so an exported script
+    // replays from anywhere) — if a later step throws, what already ran is kept.
+    const onStep = (st) => {
       const c = { ...st };
       for (const k of ['assert', 'loadStateFile', 'importSave']) if (typeof c[k] === 'string') c[k] = path.resolve(bd, c[k]);
       record(c);
-    }
+    };
+    const res = await runSteps(emu, steps, { outDir: out, baseDir: bd, states, checkWrite: await writeGuard(), onStep });
     const frame = await emu.frameNum();
     if (out) await writeFile(path.join(out, 'timeline.json'), JSON.stringify({ rom: romPath, pass: res.failures === 0, steps: res.timeline }, null, 2));
 
@@ -387,180 +482,60 @@ States saved here are shared with save_state/load_state.`,
       return true;
     };
     let dropped = 0;
-    for (const s of res.shots) if (!pushImg(`shot "${s.name}" @ frame ${s.frame}:`, scalePng(s.png, scale))) dropped++;
+    for (const s of res.shots) if (!pushImg(`${s.name} f${s.frame}:`, scalePng(s.png, scale))) dropped++;
     for (const r of res.records) {
       // Keep sheets <= ~1600px wide (larger images get downscaled by vision models).
       const cols = Math.min(r.pngs.length, 4), fw = emu.system === 'gb' ? 160 : 240;
       const sheetScale = Math.max(1, Math.min(scale, Math.floor(1600 / (cols * fw))));
-      const sheet = contactSheet(r.pngs, { cols, scale: sheetScale });
-      if (!pushImg(`record "${r.prefix}": ${r.pngs.length} frames (${r.frames.join(', ')}), left-to-right, top-to-bottom:`, sheet)) dropped++;
+      if (!pushImg(`${r.prefix}: frames ${r.frames.join(',')} (left-right, top-bottom):`, contactSheet(r.pngs, { cols, scale: sheetScale }))) dropped++;
     }
-    const lines = res.timeline.map((e) => {
+    // Only steps with something to say get a line (waits/taps are in the frame count).
+    const lines = res.timeline.filter((e) => 'value' in e || 'met' in e || e.assert || ('stuck' in e && !e.stuck)).map((e) => {
       let l = `#${e.i} f${e.frame} ${e.action}`;
       if ('value' in e) l += ` = ${JSON.stringify(e.value)}`;
+      if ('met' in e) l += e.met ? ` met f${e.metFrame}` : ' NOT met';
       if ('stuck' in e && !e.stuck) l += ' (did not stick)';
-      if (e.assert) l += e.assert.pass ? ' ✓' : ` ✗ ${JSON.stringify(e.assert)}`;
+      if (e.assert) l += e.assert.pass ? ' ok' : ` FAIL ${JSON.stringify(e.assert)}`;
       return l;
     });
-    const summary = `${res.failures ? `FAIL (${res.failures} failed assert${res.failures === 1 ? '' : 's'})` : 'OK'} — ran ${steps.length} steps, now at frame ${frame}.` +
-      (dropped ? ` ${dropped} image(s) not shown (maxImages=${maxImages}${out ? `; all saved in ${out}` : ''}).` : '') +
-      `\n${lines.join('\n')}`;
-    const r = result(summary, { pass: res.failures === 0, failures: res.failures, frame, timeline: res.timeline }, images);
+    const summary = `${res.failures ? `FAIL (${res.failures})` : 'OK'}: ${steps.length} steps, frame ${frame}.` +
+      (dropped ? ` ${dropped} image(s) not shown${out ? `; saved in ${out}` : ''}.` : '') +
+      (lines.length ? `\n${lines.join('\n')}` : '');
+    const r = result(summary, { pass: res.failures === 0, failures: res.failures, frame }, images);
     return res.failures ? { ...r, isError: true } : r;
   });
 
-  // ---- Waiting on conditions ----
-  tool('wait_until', {
-    title: 'Wait until',
-    description: `Run the game until a condition holds, stopping on the FIRST frame where it does (or after maxFrames). Replaces "wait, read, check" loops. Give either a RAM condition (address + op + value, e.g. wait until HP at 0x03001a4c == 0, or op "changed") or a screen condition: screen "changed" (the picture's video memory differs from now — e.g. a menu opened) or "stable" (unchanged for \`frames\` frames — e.g. a screen transition finished). Fast-forwards while checking, then pins down the exact frame; precise=true checks every frame at 1x (catches conditions that are true for only a few frames).`,
+  tool('assert_golden', {
+    description: 'Compare the frame to a golden PNG (created if missing). `ignore` masks rects (clocks). On failure returns current/golden/diff images.',
     inputSchema: {
-      address: Address.optional(),
-      as: z.enum(Object.keys(VALUE_TYPES)).default('u8'),
-      op: z.enum(['eq', 'ne', 'gt', 'lt', 'gte', 'lte', 'changed']).default('eq'),
-      value: z.number().int().optional(),
-      screen: z.enum(['changed', 'stable']).optional(),
-      frames: z.number().int().positive().default(30).describe('For screen "stable": how many unchanged frames'),
-      maxFrames: z.number().int().positive().max(216000).default(600),
-      precise: z.boolean().default(false),
-      screenshot: z.boolean().default(false).describe('Return a screenshot of the frame it stopped on'),
+      golden: z.string(),
+      threshold: z.number().min(0).max(1).default(0.02).describe('max fraction of differing pixels'),
+      tolerance: z.number().int().min(0).max(255).default(16),
+      ignore: z.array(Rect).default([]),
       scale: Scale,
     },
-    outputSchema: { met: z.boolean(), frame: z.number(), waited: z.number() },
-    annotations: ACT,
-  }, async ({ address, as, op, value, screen, frames, maxFrames, precise, screenshot, scale }) => {
-    let cond;
-    if (screen) cond = { screen, frames };
-    else if (address !== undefined) cond = { address: parseAddress(address), as, op, value };
-    else return errText('give `address` (+ op/value) or `screen`');
-    const before = await emu.waitTarget(), f0 = await emu.frameNum();
-    const r = await emu.waitFor(cond, { maxFrames, precise });
-    record({ wait: r.frame - before });
-    const what = screen ? `screen ${screen}${screen === 'stable' ? ` for ${frames} frames` : ''}` : `${hex(cond.address)} ${as} ${op}${op === 'changed' ? '' : ` ${value}`}`;
-    const text = r.met ? `Met (${what}) at frame ${r.frame}, after ${r.frame - f0} frames.` : `NOT met (${what}) within ${maxFrames} frames; stopped at frame ${r.frame}.`;
-    const extra = screenshot ? [png(scalePng(await emu.screenshot(), scale))] : [];
-    return result(text, { met: r.met, frame: r.frame, waited: r.frame - f0 }, extra);
+  }, async ({ golden, threshold, tolerance, ignore, scale }) => {
+    const shot = await emu.screenshot();
+    const goldenPath = await writePath(golden);
+    const res = await assertGolden(shot, goldenPath, { threshold, tolerance, ignore });
+    record({ assert: goldenPath, threshold, tolerance, ...(ignore.length ? { ignore } : {}) });
+    const out = { pass: res.pass, created: !!res.created, fraction: res.fraction ?? 0 };
+    if (res.created) return result(`Golden created: ${res.goldenPath}. Check it:`, out, [png(scalePng(shot, scale))]);
+    const pct = (res.fraction * 100).toFixed(2);
+    if (res.pass) return result(`PASS (${pct}% differ).`, out);
+    const why = res.mismatchDimensions ? 'frame size differs from the golden' : `${pct}% differ`;
+    const images = [{ type: 'text', text: 'current:' }, png(scalePng(shot, scale)),
+      { type: 'text', text: 'golden:' }, png(scalePng(await readFile(res.goldenPath), scale))];
+    if (res.diffPng) images.push({ type: 'text', text: 'diff (red):' }, png(scalePng(res.diffPng, scale)));
+    return { ...result(`FAIL: ${why}.${res.diffPath ? ` Diff: ${res.diffPath}` : ''}`, out, images), isError: true };
   });
 
-  // ---- CPU / video inspection ----
-  tool('read_cpu', {
-    title: 'Read CPU registers',
-    description: 'CPU registers on the current frame. GBA (ARM7): r0-r12, sp, lr, pc (+ the executing address after prefetch), cpsr mode/Thumb/flags. GB (SM83): pc, sp, a/f/b/c/d/e/h/l, flags, ime, halted. Handy to tell "hung in a loop" (pc stays put across waits) from "running".',
-    inputSchema: {},
-    outputSchema: { cpu: z.record(z.string(), z.any()) },
-    annotations: RO,
-  }, async () => {
-    const c = await emu.readCpu();
-    const h4 = (n) => '0x' + (n >>> 0).toString(16).padStart(8, '0'), h2 = (n) => '0x' + n.toString(16).padStart(4, '0'), h1 = (n) => n.toString(16).padStart(2, '0');
-    const text = emu.system === 'gba'
-      ? `pc=${h4(c.pc)} (executing ${h4(c.executing)}) ${c.thumb ? 'Thumb' : 'ARM'} mode=${c.mode} sp=${h4(c.sp)} lr=${h4(c.lr)} cpsr=${h4(c.cpsr)} [${['n', 'z', 'c', 'v'].filter((k) => c.flags[k]).join('').toUpperCase() || '-'}]${c.irqDisabled ? ' IRQs off' : ''}\n` +
-        c.r.map((v, i) => `r${i}=${h4(v)}`).join(' ')
-      : `pc=${h2(c.pc)} sp=${h2(c.sp)} af=${h1(c.a)}${h1(c.f)} bc=${h1(c.b)}${h1(c.c)} de=${h1(c.d)}${h1(c.e)} hl=${h1(c.h)}${h1(c.l)} flags=[${['z', 'n', 'h', 'c'].filter((k) => c.flags[k]).join('').toUpperCase() || '-'}] ime=${c.ime ? 1 : 0}${c.halted ? ' HALTED' : ''}`;
-    return result(`Frame ${await emu.frameNum()}: ${text}`, { cpu: c });
-  });
-
-  tool('read_sprites', {
-    title: 'Read sprites (OAM)',
-    description: 'Decode the sprite table: position, size, tile, palette, flips and priority of every hardware sprite, and (by default) a screenshot with the on-screen sprites outlined (box colours cycle; the list is in the same order). Use it to find the player/enemies on screen without a RAM search.',
-    inputSchema: {
-      all: z.boolean().default(false).describe('List all OAM entries, not just the ones on screen'),
-      overlay: z.boolean().default(true).describe('Return a screenshot with sprite boxes drawn'),
-      scale: Scale,
-    },
-    outputSchema: { sprites: z.array(z.record(z.string(), z.any())) },
-    annotations: RO,
-  }, async ({ all, overlay, scale }) => {
-    const r = await emu.readRegions();
-    const list = emu.system === 'gba' ? gbaSprites(r) : gbSprites(r, { cgb: !!r.isCgbWram });
-    const shown = all ? list : list.filter((s) => s.onScreen);
-    const visible = list.filter((s) => s.onScreen);
-    const lines = shown.map((s) => `#${s.index} x=${s.x} y=${s.y} ${s.w}x${s.h} tile=${s.tile} pal=${s.palette}${s.hflip ? ' hflip' : ''}${s.vflip ? ' vflip' : ''}${s.affine ? ' affine' : ''}${s.onScreen ? '' : ' (off-screen/hidden)'}`);
-    const extra = overlay ? [png(drawBoxes(await emu.screenshot(), visible, scale))] : [];
-    return result(`${visible.length} sprite(s) on screen (of ${list.length} OAM entries) at frame ${await emu.frameNum()}.${lines.length ? '\n' + lines.join('\n') : ''}`, { sprites: shown }, extra);
-  });
-
-  tool('view_vram', {
-    title: 'View tiles / palettes',
-    description: 'Render video memory as an image: what="tiles" shows the tile graphics (GBA: region "bg" char blocks or "obj" sprite tiles, 4bpp with palette bank `palette`, or bpp8; GB: the 384 tiles of VRAM bank `bank` with BG palette `palette`), what="palettes" shows every palette as colour swatches (BG rows first, then OBJ).',
-    inputSchema: {
-      what: z.enum(['tiles', 'palettes']).default('tiles'),
-      region: z.enum(['bg', 'obj']).default('bg').describe('GBA tiles: background or sprite tiles'),
-      palette: z.number().int().min(0).max(15).default(0),
-      bpp8: z.boolean().default(false).describe('GBA: decode as 256-colour tiles'),
-      bank: z.number().int().min(0).max(1).default(0).describe('GBC: VRAM bank'),
-      scale: z.number().int().min(1).max(4).default(2),
-    },
-    annotations: RO,
-  }, async ({ what, region, palette, bpp8, bank, scale }) => {
-    const r = await emu.readRegions();
-    const cgb = !!r.isCgbWram;
-    let img, desc;
-    if (what === 'palettes') {
-      img = palettesPng(emu.system === 'gba' ? gbaPalettes(r) : gbPalettes(r, { cgb }));
-      desc = emu.system === 'gba' ? 'GBA palettes: 16 BG rows then 16 OBJ rows of 16 colours' : (cgb ? 'CGB palettes: 8 BG then 8 OBJ' : 'DMG palettes: BGP, OBP0, OBP1');
-    } else if (emu.system === 'gba') {
-      img = gbaTilesPng(r, { region, palette, bpp8 });
-      desc = `GBA ${region} tiles (${bpp8 ? '8bpp' : `4bpp, palette ${palette}`}), 32 per row, tile 0 top-left`;
-    } else {
-      if (bank === 1 && r.vram.length < 0x4000) return errText('VRAM bank 1 only exists on GBC');
-      img = gbTilesPng(r, { bank, palette, cgb });
-      desc = `GB tiles 0x8000-0x97FF bank ${bank}, 16 per row (tile 0 = 0x8000)`;
-    }
-    return result(`${desc}, frame ${await emu.frameNum()}.`, undefined, [png(scalePng(img, scale))]);
-  });
-
-  // ---- Cheats ----
-  tool('set_cheats', {
-    title: 'Set cheat codes',
-    description: 'Replace the active cheat codes (an empty list clears them). GBA: GameShark, Action Replay or CodeBreaker codes (e.g. CodeBreaker 8-bit write "3AAAAAAA 00VV"). GB/GBC: GameShark "01VVLLHH" (writes VV to 0xHHLL; applied at VBlank like the real device) or Game Genie. Cheats apply every frame from the next one, and survive reset.',
-    inputSchema: { codes: z.array(z.string()).describe('Cheat codes, one per entry') },
-    outputSchema: { cheats: z.array(z.string()) },
-    annotations: ACT,
-  }, async ({ codes }) => {
-    await emu.setCheats(codes);
-    record({ cheats: codes });
-    return result(codes.length ? `${codes.length} cheat(s) active: ${codes.join(', ')}` : 'Cheats cleared.', { cheats: codes });
-  });
-
-  // ---- Battery saves ----
-  tool('export_save', {
-    title: 'Export battery save',
-    description: "Write the cartridge's battery save (the .sav: SRAM/flash/EEPROM) on the current frame to a file, so a test can check what the game saved or keep it as a fixture.",
-    inputSchema: { path: z.string().describe('Where to write the .sav') },
-    outputSchema: { path: z.string(), bytes: z.number() },
-    annotations: ACT,
-  }, async ({ path: p }) => {
-    const data = await emu.readSaveData();
-    if (!data) return errText('This game has no battery save.');
-    const file = await writePath(p);
-    await mkdir(path.dirname(file), { recursive: true });
-    await writeFile(file, data);
-    return result(`Wrote ${data.length}-byte save to ${file}.`, { path: file, bytes: data.length });
-  });
-
-  tool('import_save', {
-    title: 'Import battery save',
-    description: 'Load a .sav file into the cartridge and reset, so the game boots with that save (e.g. start a test from a 100% save). reset=false patches it in without resetting.',
-    inputSchema: { path: z.string(), reset: z.boolean().default(true) },
-    outputSchema: { bytes: z.number(), frame: z.number() },
-    annotations: { ...ACT, destructiveHint: true },
-  }, async ({ path: p, reset }) => {
-    const file = await resolvePath(p);
-    const data = await readFile(file);
-    await emu.writeSaveData(data, { reset });
-    record({ importSave: file, reset });
-    const frame = await emu.frameNum();
-    return result(`Imported ${data.length}-byte save from ${file}${reset ? '; game reset' : ''}. Frame ${frame}.`, { bytes: data.length, frame });
-  });
-
-  // ---- Recording ----
   tool('export_script', {
-    title: 'Export session as a test script',
-    description: 'Turn everything done since load_rom (inputs, waits, wait_until results, states, RAM writes, cheats, saves, golden asserts, run_sequence steps) into a replayable step script — the same format run_sequence and runner.mjs take. Exploratory play becomes a regression test: add {"assert": ...} / {"assertRam": ...} steps where it matters. Replays are frame-exact.',
+    description: 'Everything done since load_rom as replayable run_sequence steps (JSON). Add assert steps to make it a regression test.',
     inputSchema: {
-      path: z.string().optional().describe('Also write the script (JSON) here'),
-      includeShots: z.boolean().default(false).describe('Keep a {"shot"} step for every screenshot you took'),
+      path: z.string().optional(),
+      includeShots: z.boolean().default(false).describe('keep a step per screenshot'),
     },
-    outputSchema: { rom: z.string(), steps: z.array(z.record(z.string(), z.any())) },
     annotations: RO,
   }, async ({ path: p, includeShots }) => {
     const steps = rec.filter((s) => includeShots || !s.shot).map((s) => ({ ...s }));
@@ -578,24 +553,17 @@ States saved here are shared with save_state/load_state.`,
       await mkdir(path.dirname(file), { recursive: true });
       await writeFile(file, JSON.stringify(script, null, 2) + '\n');
     }
-    return result(`${script.steps.length} steps${file ? ` written to ${file}` : ''}. Replay: load_rom + run_sequence(steps), or \`node runner.mjs <file>\`.\n${JSON.stringify(script, null, 1)}`, script);
+    return result(`${file ? `Wrote ${file}. ` : ''}${JSON.stringify(script)}`, { steps: script.steps.length });
   });
 
-  // ---- A/B comparison ----
   tool('ab_compare', {
-    title: 'Compare two ROM builds',
-    description: 'Run the same steps on two ROMs (e.g. the last good build and the new one) side by side in separate emulators and report, per screenshot step and RAM read, whether they differ — with A | B | diff images for the shots that do. Uses the run_sequence step format; put {"shot": "name"} / {"read": ...} steps where you want comparisons. Does not touch the currently loaded ROM.',
+    description: 'Run the same steps on two ROMs side by side; reports which shot/read steps differ, with A|B|diff images. Leaves the loaded ROM alone.',
     inputSchema: {
       romA: z.string(), romB: z.string(),
       steps: z.array(z.record(z.string(), z.any())).min(1),
       tolerance: z.number().int().min(0).max(255).default(16),
       scale: z.number().int().min(1).max(3).default(2),
       maxImages: z.number().int().min(0).max(10).default(4),
-    },
-    outputSchema: {
-      identical: z.boolean(),
-      shots: z.array(z.object({ name: z.string(), frame: z.number(), fraction: z.number() })),
-      reads: z.array(z.object({ step: z.number(), a: z.any(), b: z.any(), same: z.boolean() })),
     },
     annotations: RO,
   }, async ({ romA, romB, steps, tolerance, scale, maxImages }) => {
@@ -607,132 +575,88 @@ States saved here are shared with save_state/load_state.`,
     };
     const [A, B] = await Promise.all([runOne(pa), runOne(pb)]);
     if (A.system !== B.system) return errText(`ROMs are for different consoles (${A.system} vs ${B.system}).`);
-    const shots = [], images = [];
+    const lines = [], images = [];
+    let identical = true;
     A.shots.forEach((sa, i) => {
       const sb = B.shots[i];
       if (!sb) return;
       const c = compare(sa.png, sb.png, { tolerance });
-      shots.push({ name: sa.name, frame: sa.frame, fraction: c.fraction });
-      if (c.fraction > 0 && images.length / 2 < maxImages) {
+      if (c.fraction === 0) { lines.push(`${sa.name} f${sa.frame}: same`); return; }
+      identical = false;
+      lines.push(`${sa.name} f${sa.frame}: ${(c.fraction * 100).toFixed(2)}% differ`);
+      if (images.length / 2 < maxImages) {
         const tiles = [sa.png, sb.png, ...(c.diffPng ? [c.diffPng] : [])];
-        images.push({ type: 'text', text: `"${sa.name}" @ frame ${sa.frame}: A | B | diff (${(c.fraction * 100).toFixed(2)}% differ)` },
-          png(contactSheet(tiles, { cols: tiles.length, scale })));
+        images.push({ type: 'text', text: `${sa.name} A|B|diff:` }, png(contactSheet(tiles, { cols: tiles.length, scale })));
       }
     });
-    const reads = [];
     A.timeline.forEach((ea, i) => {
       if (!('value' in ea)) return;
-      const eb = B.timeline[i];
-      reads.push({ step: i, a: ea.value, b: eb?.value, same: JSON.stringify(ea.value) === JSON.stringify(eb?.value) });
+      const vb = B.timeline[i]?.value;
+      const same = JSON.stringify(ea.value) === JSON.stringify(vb);
+      if (!same) identical = false;
+      lines.push(`#${i} read: A=${JSON.stringify(ea.value)} B=${JSON.stringify(vb)}${same ? '' : ' DIFFERS'}`);
     });
-    const identical = shots.every((s) => s.fraction === 0) && reads.every((r) => r.same);
-    const lines = [
-      ...shots.map((s) => `shot "${s.name}" f${s.frame}: ${s.fraction === 0 ? 'identical' : `${(s.fraction * 100).toFixed(2)}% differ`}`),
-      ...reads.map((r) => `step #${r.step} read: A=${JSON.stringify(r.a)} B=${JSON.stringify(r.b)}${r.same ? '' : '  <-- differs'}`),
-    ];
-    return result(`${identical ? 'IDENTICAL' : 'DIFFERENT'}: ${path.basename(pa)} vs ${path.basename(pb)}${A.failures + B.failures ? ` (failed asserts: A ${A.failures}, B ${B.failures})` : ''}\n${lines.join('\n') || '(no shot/read steps to compare)'}`,
-      { identical, shots, reads }, images);
+    const fails = A.failures + B.failures ? ` (failed asserts: A ${A.failures}, B ${B.failures})` : '';
+    return result(`${identical ? 'IDENTICAL' : 'DIFFERENT'}${fails}\n${lines.join('\n') || '(no shot/read steps)'}`, { identical }, images);
   }, { needsRom: false });
 
-  // ---- RAM search ----
-  const SearchOut = {
-    count: z.number(),
-    results: z.array(z.object({ address: z.number(), region: z.string(), value: z.number(), previous: z.number().optional(), bank: z.number().optional() })),
-  };
-  const formatSearch = (limit) => {
-    const rows = search.results(limit);
-    const lines = rows.map((r) => `  ${hex(r.address)}${r.bank !== undefined ? ` (bank ${r.bank})` : ''} [${r.region}] = ${r.value}${r.previous !== undefined ? ` (was ${r.previous})` : ''}`);
-    const more = search.count > rows.length ? `\n  … ${search.count - rows.length} more` : '';
-    return { text: `${search.count} candidate${search.count === 1 ? '' : 's'} (${search.type}).${rows.length ? `\n${lines.join('\n')}${more}` : ''}`, data: { count: search.count, results: rows } };
-  };
-
-  tool('ram_search_start', {
-    title: 'Start RAM search',
-    description: `Start a value search ("cheat search") to find where the game stores something (HP, score, coins, x-position…). Snapshots every candidate address on the current frame. Then change the value in game and narrow with ram_search_filter until one address is left. If you already know the current value, pass it as \`value\` to filter immediately. Searches GBA EWRAM+IWRAM, or GB WRAM (all CGB banks)+HRAM+cart RAM.`,
+  // ---- Find ----
+  tool('ram_search', {
+    description: 'Find where a value lives (HP, score…). "start" snapshots RAM (type, region, optional known value). "filter" narrows using the current frame: op eq/ne/gt/lt/gte/lte vs value; changed/unchanged/increased/decreased vs the last snapshot; delta = changed by value. "list" shows candidates. Change the value in game between filters.',
     inputSchema: {
-      type: z.enum(SEARCH_TYPES).default('u8').describe('Value width/signedness (little-endian)'),
-      region: z.string().optional().describe('Limit to one region: GBA "ewram"/"iwram"; GB "wram"/"hram"/"sram"'),
-      value: z.number().int().optional().describe('Known current value: keep only addresses equal to it'),
-      limit: z.number().int().min(0).max(100).default(20),
-    },
-    outputSchema: SearchOut,
-    annotations: RO,
-  }, async ({ type, region, value, limit }) => {
-    search = new RamSearch(emu.system, await emu.readRegions(), { type, region });
-    if (value !== undefined) search.filter(await emu.readRegions(), 'eq', value);
-    const { text, data } = formatSearch(search.count <= limit ? limit : 0);
-    return result(`RAM search started at frame ${await emu.frameNum()}: ${text}${value === undefined ? '\nNow change the value in game, then call ram_search_filter.' : ''}`, data);
-  });
-
-  tool('ram_search_filter', {
-    title: 'Filter RAM search',
-    description: `Narrow the active RAM search using the current frame. Ops: eq/ne/gt/lt/gte/lte compare to \`value\`; changed/unchanged/increased/decreased compare to the previous snapshot; delta keeps addresses whose value changed by exactly \`value\` (e.g. -1 after losing 1 HP). Repeat (changing the value in game between calls) until 1-3 candidates remain, then verify with write_memory.`,
-    inputSchema: {
-      op: z.enum(SEARCH_OPS),
+      action: z.enum(['start', 'filter', 'list']),
+      type: z.enum(SEARCH_TYPES).default('u8'),
+      region: z.string().optional().describe('GBA ewram/iwram; GB wram/hram/sram'),
+      op: z.enum(SEARCH_OPS).optional(),
       value: z.number().int().optional(),
-      limit: z.number().int().min(0).max(100).default(20).describe('Candidates to list'),
+      limit: z.number().int().min(0).max(200).default(10).describe('candidates to list'),
     },
-    outputSchema: SearchOut,
     annotations: RO,
-  }, async ({ op, value, limit }) => {
-    if (!search) return errText('No active RAM search. Call ram_search_start first.');
-    const before = search.count;
-    search.filter(await emu.readRegions(), op, value);
-    const { text, data } = formatSearch(limit);
-    return result(`${op}${value !== undefined ? ` ${value}` : ''}: ${before} -> ${text}`, data);
+  }, async ({ action, type, region, op, value, limit }) => {
+    let head;
+    if (action === 'start') {
+      search = new RamSearch(emu.system, await emu.readRegions(), { type, region });
+      if (value !== undefined) search.filter(await emu.readRegions(), 'eq', value);
+      head = 'Started';
+    } else {
+      if (!search) return errText('No RAM search; use action "start" first.');
+      if (action === 'filter') {
+        if (!op) return errText('filter needs `op`');
+        const before = search.count;
+        search.filter(await emu.readRegions(), op, value);
+        head = `${op}${value !== undefined ? ` ${value}` : ''}: ${before} ->`;
+      } else head = 'Candidates:';
+    }
+    const rows = search.results(limit);
+    const lines = rows.map((r) => `${hex(r.address)}${r.bank !== undefined ? `/b${r.bank}` : ''} ${r.region} =${r.value}${r.previous !== undefined ? ` (was ${r.previous})` : ''}`);
+    const more = search.count > rows.length ? `\n…${search.count - rows.length} more` : '';
+    return result(`${head} ${search.count} (${search.type}).${lines.length ? `\n${lines.join('\n')}${more}` : ''}`, { count: search.count });
   });
 
-  tool('ram_search_results', {
-    title: 'List RAM search candidates',
-    description: 'List the current candidates of the active RAM search with their latest values (without filtering).',
-    inputSchema: { limit: z.number().int().min(1).max(500).default(50) },
-    outputSchema: SearchOut,
-    annotations: RO,
-  }, async ({ limit }) => {
-    if (!search) return errText('No active RAM search. Call ram_search_start first.');
-    const { text, data } = formatSearch(limit);
-    return result(text, data);
-  });
-
-  // ---- Misc ----
-  tool('frame_number', {
-    title: 'Frame number',
-    description: 'Get the current emulated frame number.',
-    inputSchema: {},
-    outputSchema: FrameOut,
-    annotations: RO,
-  }, async () => { const frame = await emu.frameNum(); return result(String(frame), { frame }); });
-
-  tool('reset', {
-    title: 'Reset game',
-    description: 'Reset the game like the console\'s reset button: the battery save and cheats are kept, the frame clock restarts at 1. Deterministic. Saved states are kept.',
-    inputSchema: {},
-    annotations: { ...ACT, destructiveHint: true },
-  }, async () => {
-    await emu.restart();
-    record({ reset: true });
-    return result(`Game reset. Frame ${await emu.frameNum()}.`);
-  });
-
+  // ---- Status ----
   const statusData = async () => (emu
-    ? { loaded: true, rom: romPath, system: sysName(emu.system), frame: await emu.frameNum(), states: [...states.keys()], held: await emu.heldButtons(), ramSearch: search ? search.count : null, cheats: emu.cheats, recordedSteps: rec.length }
-    : { loaded: false, states: [] });
+    ? { loaded: true, rom: romPath, system: sysName(emu.system), frame: await emu.frameNum(), held: await emu.heldButtons(), states: [...states.keys()], cheats: emu.cheats.length, ramSearch: search ? search.count : null, recordedSteps: rec.length }
+    : { loaded: false });
 
   tool('status', {
-    title: 'Status',
-    description: 'Report the loaded ROM, current frame, held buttons, saved states and any active RAM search.',
+    description: 'Loaded ROM, frame, held buttons, saved states, cheats, RAM search.',
     inputSchema: {},
-    outputSchema: {
-      loaded: z.boolean(), rom: z.string().optional(), system: z.string().optional(), frame: z.number().optional(),
-      states: z.array(z.string()), held: z.array(z.string()).optional(), ramSearch: z.number().nullable().optional(),
-      cheats: z.array(z.string()).optional(), recordedSteps: z.number().optional(),
-    },
     annotations: RO,
   }, async () => {
     const s = await statusData();
-    if (!s.loaded) return result('No ROM loaded.', s);
-    return result(`ROM: ${romName} (${s.system}), frame ${s.frame}, held: ${s.held.join(', ') || 'none'}, ${s.states.length} saved state(s)${s.states.length ? ` [${s.states.join(', ')}]` : ''}${search ? `, RAM search: ${search.count} candidates` : ''}${s.cheats.length ? `, ${s.cheats.length} cheat(s)` : ''}, ${s.recordedSteps} recorded step(s).`, s);
+    return result(JSON.stringify(s), s);
   }, { needsRom: false });
+
+  // Serve a slimmed tool list (definitions are resent with every request). The SDK
+  // keeps its handlers in a private map; if that ever changes, the full list is served.
+  const handlers = /** @type {any} */ (server.server)._requestHandlers;
+  const listTools = handlers?.get?.('tools/list');
+  if (listTools) {
+    handlers.set('tools/list', async (...args) => {
+      const res = await listTools(...args);
+      return { ...res, tools: res.tools.map(({ execution, ...t }) => ({ ...t, inputSchema: slimSchema(t.inputSchema) })) };
+    });
+  }
 
   // ---- Resources ----
   server.registerResource('screen', 'emu://screen', {
@@ -793,12 +717,12 @@ If this is the first run, say that you created the baselines and ask me to confi
 
 1. load_rom, then play (press / run_sequence) to a point where "${variable}" is in play.
    save_state id="start" so you can retry.
-2. ram_search_start${region ? ` with region="${region}"` : ''}. If you can read the value on screen, pass it as
+2. ram_search action="start"${region ? ` region="${region}"` : ''}. If you can read the value on screen, pass it as
    \`value\` (try type "u8" first; "u16" for values above 255).
-3. Change the value in game (take damage, collect a coin…), then ram_search_filter:
-   with "eq" + the new value if you can see it, otherwise "decreased"/"increased",
-   or "delta" with the exact change. Also filter "unchanged" after doing something
-   that does NOT affect the value, to discard noise.
+3. Change the value in game (take damage, collect a coin…), then ram_search
+   action="filter": op "eq" + the new value if you can see it, otherwise
+   "decreased"/"increased", or "delta" with the exact change. Also filter
+   "unchanged" after doing something that does NOT affect the value.
 4. Repeat step 3 until 1–3 candidates remain (usually 2–4 rounds).
 5. VERIFY: write_memory a distinctive value to the candidate, wait_frames a few, and
    screenshot — the game should reflect it. If not, try the next candidate.
@@ -813,12 +737,12 @@ Report the confirmed address, type, and how you verified it.`));
 `Record a regression test for "${rom}": ${goal}
 
 1. load_rom with rom="${rom}" (this starts a fresh recording).
-2. Play towards the goal with press / set_button / wait_frames. Prefer wait_until
+2. Play towards the goal with run_sequence / press / set_button. Prefer wait_until
    over guessing wait lengths (e.g. wait_until screen "stable" after a transition,
    or a RAM condition). Use screenshot to see where you are.
 3. At each point that matters, add a check: assert_golden for the picture (mask
    clocks/timers with \`ignore\`), or note a RAM address/value for an assertRam step
-   (use ram_search_* to find addresses if needed).
+   (use ram_search to find addresses if needed).
 4. export_script${p ? ` with path="${p}"` : ''} — then add {"assertRam": ...} steps to the
    exported steps where you noted values.
 5. Prove it replays: load_rom again and run_sequence with the exported steps; it

@@ -1,5 +1,7 @@
 // Tiny hand-assembled GB test ROMs shared by the tests.
 
+import { crc32 } from '../png.mjs';
+
 // Interactive 32KB DMG ROM: each loop, read the action buttons, store the nibble at
 // WRAM 0xC000, and set the background palette to 0xFF while any button is held (0xE4
 // otherwise). So holding A changes both memory (0xC000) and the screen (white->black).
@@ -68,4 +70,22 @@ export function makeVblankGbRom() {
   ];
   for (let i = 0; i < code.length; i++) rom[0x150 + i] = code[i];
   return rom;
+}
+
+/** Minimal store-only .zip (no compression) holding one file — enough to test
+ *  zipped-ROM loading without a zip dependency. */
+export function makeZip(name, data) {
+  const crc = crc32(data), n = Buffer.from(name);
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(20, 4);
+  local.writeUInt32LE(crc, 14); local.writeUInt32LE(data.length, 18); local.writeUInt32LE(data.length, 22);
+  local.writeUInt16LE(n.length, 26);
+  const central = Buffer.alloc(46);
+  central.writeUInt32LE(0x02014b50, 0); central.writeUInt16LE(20, 4); central.writeUInt16LE(20, 6);
+  central.writeUInt32LE(crc, 16); central.writeUInt32LE(data.length, 20); central.writeUInt32LE(data.length, 24);
+  central.writeUInt16LE(n.length, 28);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(1, 8); end.writeUInt16LE(1, 10);
+  end.writeUInt32LE(46 + n.length, 12); end.writeUInt32LE(30 + n.length + data.length, 16);
+  return Buffer.concat([local, n, data, central, n, end]);
 }

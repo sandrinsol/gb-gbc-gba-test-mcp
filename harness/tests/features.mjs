@@ -1,4 +1,4 @@
-// Driver-level guarantees of reset and waitFor:
+// Driver-level guarantees of reset, waitFor, zipped ROMs and launch errors:
 //   - restart() is deterministic: after a reset the game replays exactly like a
 //     fresh boot (same frames, same RAM).
 //   - waitFor() in fast mode (fast-forward + rewind) stops on the same frame as a
@@ -6,8 +6,11 @@
 //
 //   node tests/features.mjs   (exit 0 = pass, 1 = fail)
 
-import { EmuHarness } from '../driver.mjs';
+import { writeFile, mkdir } from 'node:fs/promises';
+import path from 'node:path';
+import { EmuHarness, romSystem } from '../driver.mjs';
 import { compare } from '../assert.mjs';
+import { makeInteractiveGbRom, makeZip } from './gb-roms.mjs';
 
 let failed = 0;
 const ok = (name, cond, detail) => {
@@ -69,6 +72,29 @@ const ok = (name, cond, detail) => {
   ok('advancing invalidates the cache', calls === 1);
   emu.page.evaluate = orig;
   await emu.close();
+}
+
+// --- A zipped GB ROM boots on the GB core (console read from inside the zip) ---
+{
+  await mkdir(path.resolve('out'), { recursive: true });
+  const zipPath = path.resolve('out', 'input-zipped.zip');
+  await writeFile(zipPath, makeZip('input.gb', makeInteractiveGbRom()));
+  ok('romSystem looks inside .zip', (await romSystem(zipPath)) === 'gb');
+  const emu = await EmuHarness.launch(zipPath, { reuse: true });
+  await emu.waitFrames(20);
+  ok('zipped GB ROM runs as GB', emu.system === 'gb' && (await emu.videoDimensions()).w === 160);
+  ok('zipped GB ROM: RAM reads use the GB map', (await emu.readU8(0xc000)) === 0x0f);
+  await emu.close();
+}
+
+// --- A missing browser gives an actionable error ---
+{
+  const saved = process.env.GBTEST_CHROMIUM;
+  process.env.GBTEST_CHROMIUM = '/nonexistent/chrome';
+  let msg = '';
+  try { await EmuHarness.launch('../anguna.gba'); } catch (e) { msg = e.message; }
+  if (saved === undefined) delete process.env.GBTEST_CHROMIUM; else process.env.GBTEST_CHROMIUM = saved;
+  ok('missing Chromium -> how-to-fix error', /playwright install chromium/.test(msg) && /GBTEST_CHROMIUM/.test(msg), msg.slice(0, 120));
 }
 
 await EmuHarness.shutdown();

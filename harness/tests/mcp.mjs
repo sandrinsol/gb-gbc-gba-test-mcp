@@ -41,17 +41,24 @@ await Promise.all([server.connect(st), client.connect(ct)]);
 const call = (name, args = {}) => client.callTool({ name, arguments: args });
 const textOf = (r) => r.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n');
 const images = (r) => r.content.filter((c) => c.type === 'image').map((c) => decodePng(Buffer.from(c.data, 'base64')));
+const frameNow = async () => (await call('status')).structuredContent.frame;
+// export_script's text ends with the script as one-line JSON.
+const scriptOf = (r) => JSON.parse(textOf(r).slice(textOf(r).indexOf('{')));
 
 try {
   // --- Listing ---
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name);
-  for (const n of ['load_rom', 'wait_frames', 'press', 'set_button', 'screenshot', 'read_memory', 'write_memory',
-    'save_state', 'load_state', 'assert_golden', 'run_sequence', 'ram_search_start', 'ram_search_filter',
-    'ram_search_results', 'frame_number', 'reset', 'status', 'wait_until', 'read_cpu', 'read_sprites', 'view_vram',
-    'set_cheats', 'export_save', 'import_save', 'export_script', 'ab_compare']) ok(`tool listed: ${n}`, names.includes(n));
+  const ALL = ['load_rom', 'wait_frames', 'press', 'set_button', 'wait_until', 'reset', 'screenshot', 'read_memory',
+    'read_cpu', 'read_sprites', 'view_vram', 'status', 'write_memory', 'save_state', 'load_state', 'set_cheats',
+    'battery_save', 'run_sequence', 'assert_golden', 'export_script', 'ab_compare', 'ram_search'];
+  for (const n of ALL) ok(`tool listed: ${n}`, names.includes(n));
+  ok('exactly the documented tools', names.length === ALL.length, `${names.length}`);
   ok('screenshot is annotated read-only', tools.find((t) => t.name === 'screenshot').annotations?.readOnlyHint === true);
-  ok('read_memory has an output schema', !!tools.find((t) => t.name === 'read_memory').outputSchema);
+  const listJson = JSON.stringify(tools);
+  ok('tool list is slim (no output schemas, $schema or ±2^53 bounds)',
+    !tools.some((t) => t.outputSchema) && !listJson.includes('$schema') && !listJson.includes('9007199254740991'));
+  ok('tool list stays small', listJson.length / 4 < 3000, `~${Math.round(listJson.length / 4)} tokens`);
   const { prompts } = await client.listPrompts();
   ok('prompts listed', ['smoke_test_rom', 'regression_check', 'find_ram_address', 'record_regression_test'].every((p) => prompts.some((x) => x.name === p)));
   const { resources } = await client.listResources();
@@ -68,14 +75,14 @@ try {
   ok('wait_frames lands exactly', r.structuredContent.frame === 300, `frame ${r.structuredContent.frame}`);
   r = await call('screenshot');
   let [img] = images(r);
-  ok('screenshot defaults to 3x (720x480)', img && img.width === 720 && img.height === 480, img && `${img.width}x${img.height}`);
+  ok('screenshot defaults to 2x (480x320)', img && img.width === 480 && img.height === 320, img && `${img.width}x${img.height}`);
   r = await call('screenshot', { scale: 1, save: 'harness/out/mcp-test/native.png' });
   [img] = images(r);
   ok('screenshot scale=1 is native 240x160', img.width === 240 && img.height === 160);
   ok('screenshot save writes a file', existsSync(path.join(OUT, 'native.png')));
 
   // --- Concurrency: parallel calls are serialized ---
-  const [w, f] = await Promise.all([call('wait_frames', { frames: 30 }), call('frame_number')]);
+  const [w, f] = await Promise.all([call('wait_frames', { frames: 30 }), call('status')]);
   ok('parallel calls run in order', w.structuredContent.frame === 330 && f.structuredContent.frame === 330,
     `${w.structuredContent.frame} / ${f.structuredContent.frame}`);
 
@@ -85,7 +92,7 @@ try {
   r = await call('read_memory', { address: 'nonsense' });
   ok('bad address is a clean error', r.isError && /invalid address/.test(textOf(r)));
   r = await call('write_memory', { address: '0x02000100', value: 0xbeef, as: 'u16' });
-  ok('write_memory sticks', !r.isError && r.structuredContent.stuck === true && r.structuredContent.readBack === 'ef be', textOf(r));
+  ok('write_memory sticks', !r.isError && r.structuredContent.stuck === true, textOf(r));
   r = await call('read_memory', { address: 0x02000100, length: 2, as: 'u16' });
   ok('write visible to read_memory', r.structuredContent.values[0] === 0xbeef);
 
@@ -94,8 +101,10 @@ try {
   ok('save_state to file', !r.isError && existsSync(path.join(OUT, 'cp.state')), textOf(r));
   const shotAtCp = (await call('screenshot', { scale: 1 })).content[1].data;
   await call('press', { buttons: ['START', 'A'], hold: 6, release: 30 });
+  await call('save_state', {});
   r = await call('load_state', { path: 'harness/out/mcp-test/cp.state' });
   ok('load_state from file', !r.isError, textOf(r));
+  ok('loading a file keeps the named "default" state', (await call('status')).structuredContent.states.includes('default'));
   ok('state restore is pixel-exact', (await call('screenshot', { scale: 1 })).content[1].data === shotAtCp);
   ok('repeated screenshots are identical', (await call('screenshot', { scale: 1 })).content[1].data === shotAtCp);
   await call('write_memory', { address: '0x02000104', value: 7 });
@@ -124,7 +133,7 @@ try {
   });
   ok('run_sequence passes', !r.isError && r.structuredContent.pass === true, textOf(r).split('\n')[0]);
   ok('run_sequence returns shot + contact sheet', images(r).length === 2, `${images(r).length} images`);
-  ok('run_sequence records read values', r.structuredContent.timeline.find((e) => e.action === 'read poked')?.value === 0xbeef);
+  ok('run_sequence reports read values', /read poked = 48879/.test(textOf(r)), textOf(r));
   ok('run_sequence writes timeline.json', existsSync(path.join(OUT, 'seq', 'timeline.json')));
   r = await call('load_state', { id: 'seq' });
   ok('run_sequence states shared with load_state', !r.isError);
@@ -132,6 +141,10 @@ try {
   ok('run_sequence failed assertRam -> isError', r.isError && r.structuredContent.failures === 1);
   r = await call('run_sequence', { steps: [{ bogus: 1 }] });
   ok('run_sequence rejects unknown steps', r.isError && /unknown step/.test(textOf(r)));
+  const before = scriptOf(await call('export_script')).steps.length;
+  r = await call('run_sequence', { steps: [{ wait: 5 }, { tap: 'A' }, { bogus: 1 }] });
+  const afterSteps = scriptOf(await call('export_script')).steps;
+  ok('steps before a failing step are still recorded', r.isError && afterSteps.length >= before + 1 && afterSteps.some((s) => s.tap === 'A'), `${before} -> ${afterSteps.length}`);
 
   // --- Resources ---
   const res = /** @type {any} */ (await client.readResource({ uri: 'emu://status' }));
@@ -151,9 +164,9 @@ try {
   r = await call('wait_until', { screen: 'stable', frames: 10, maxFrames: 600 });
   ok('wait_until screen stable', !r.isError && r.structuredContent.met, textOf(r));
   r = await call('read_cpu');
-  ok('read_cpu (GBA)', !r.isError && typeof r.structuredContent.cpu.pc === 'number' && /pc=0x/.test(textOf(r)), textOf(r).split('\n')[0]);
+  ok('read_cpu (GBA)', !r.isError && typeof r.structuredContent.pc === 'number' && /pc=[0-9a-f]{8}/.test(textOf(r)), textOf(r).split('\n')[0]);
   r = await call('read_sprites');
-  ok('read_sprites returns overlay', !r.isError && images(r).length === 1 && images(r)[0].width === 720, textOf(r).split('\n')[0]);
+  ok('read_sprites returns overlay', !r.isError && images(r).length === 1 && images(r)[0].width === 480, textOf(r).split('\n')[0]);
   r = await call('view_vram', { what: 'tiles', region: 'obj' });
   ok('view_vram GBA obj tiles 256x256 @2x', images(r)[0]?.width === 512 && images(r)[0]?.height === 512);
   r = await call('view_vram', { what: 'palettes' });
@@ -177,10 +190,10 @@ try {
   await call('write_memory', { address: '0x02000200', value: 9 });
   await call('wait_frames', { frames: 20 });
   const endShot = (await call('screenshot', { scale: 1 })).content[1].data;
-  const endFrame = (await call('frame_number')).structuredContent.frame;
+  const endFrame = await frameNow();
   r = await call('export_script', { path: 'harness/out/mcp-test/session.json' });
-  ok('export_script writes a script', !r.isError && existsSync(path.join(OUT, 'session.json')) && r.structuredContent.steps.length >= 6, `${r.structuredContent.steps?.length} steps`);
-  const script = r.structuredContent;
+  const script = scriptOf(r);
+  ok('export_script writes a script', !r.isError && existsSync(path.join(OUT, 'session.json')) && script.steps.length >= 6, `${script.steps.length} steps`);
   await call('load_rom', { rom: 'anguna.gba' });
   r = await call('run_sequence', { steps: script.steps });
   ok('exported script replays', !r.isError, textOf(r).split('\n')[0]);
@@ -202,53 +215,56 @@ try {
   r = await call('load_rom', { rom: gbRom });
   ok('load_rom switches to GB', !r.isError && r.structuredContent.system === 'GB/GBC', `${Date.now() - t0}ms`);
   await call('wait_frames', { frames: 30 });
-  r = await call('ram_search_start', { value: 0x0f, region: 'wram' });
-  ok('ram_search_start with value narrows immediately', !r.isError && r.structuredContent.count > 0, textOf(r).split('\n')[0]);
+  r = await call('ram_search', { action: 'start', value: 0x0f, region: 'wram' });
+  ok('ram_search start with value narrows immediately', !r.isError && r.structuredContent.count > 0, textOf(r).split('\n')[0]);
   await call('set_button', { button: 'A', pressed: true });
   await call('wait_frames', { frames: 5 });
-  r = await call('ram_search_filter', { op: 'decreased' });
+  r = await call('ram_search', { action: 'filter', op: 'decreased' });
   ok('filter decreased', !r.isError, textOf(r).split('\n')[0]);
-  r = await call('ram_search_filter', { op: 'eq', value: 0x0e });
-  const hits = r.structuredContent.results.map((x) => x.address);
-  ok('RAM search finds 0xC000', r.structuredContent.count === 1 && hits[0] === 0xc000, textOf(r));
+  r = await call('ram_search', { action: 'filter', op: 'eq', value: 0x0e });
+  ok('RAM search finds 0xC000', r.structuredContent.count === 1 && /\n0xc000 wram =14/.test(textOf(r)), textOf(r));
+  r = await call('ram_search', { action: 'list' });
+  ok('ram_search list', /0xc000/.test(textOf(r)));
+  r = await call('ram_search', { action: 'filter' });
+  ok('ram_search filter without op errors', r.isError);
   await call('set_button', { button: 'A', pressed: false });
   await call('wait_frames', { frames: 5 });
-  r = await call('ram_search_filter', { op: 'delta', value: 1 });
+  r = await call('ram_search', { action: 'filter', op: 'delta', value: 1 });
   ok('delta filter keeps it', r.structuredContent.count === 1);
   r = await call('status');
   ok('status reports search + system', r.structuredContent.system === 'GB/GBC' && r.structuredContent.ramSearch === 1, textOf(r));
   r = await call('wait_until', { address: '0xC000', op: 'eq', value: 0x0f, maxFrames: 60 });
   ok('wait_until already true returns at once', r.structuredContent.met && r.structuredContent.waited === 0, textOf(r));
-  const f0 = (await call('frame_number')).structuredContent.frame;
+  const f0 = await frameNow();
   await call('set_button', { button: 'B', pressed: true });
   r = await call('wait_until', { address: '0xC000', op: 'changed', maxFrames: 60 });
   ok('wait_until stops on the first frame', r.structuredContent.met && r.structuredContent.frame === f0 + 1, textOf(r));
   await call('set_button', { button: 'B', pressed: false });
   r = await call('read_cpu');
-  ok('read_cpu (GB) pc in the ROM loop', r.structuredContent.cpu.pc >= 0x150 && r.structuredContent.cpu.pc < 0x180, textOf(r));
+  ok('read_cpu (GB) pc in the ROM loop', r.structuredContent.pc >= 0x150 && r.structuredContent.pc < 0x180, textOf(r));
   // Clear OAM (it powers on random, like real hardware), put one sprite in it and
   // turn sprites on: read_sprites must find exactly that one.
   await call('write_memory', { address: '0xFE00', hex: '50500100' + '00'.repeat(156) });
   await call('write_memory', { address: '0xFF40', value: 0x93 });
   r = await call('read_sprites', { overlay: false });
-  ok('read_sprites (GB) finds the poked sprite', r.structuredContent.sprites.length === 1 && r.structuredContent.sprites[0].x === 72 && r.structuredContent.sprites[0].y === 64, textOf(r));
+  ok('read_sprites (GB) finds the poked sprite', r.structuredContent.onScreen === 1 && /\n#0 72,64 8x8 t1 p0$/.test(textOf(r)), textOf(r));
   r = await call('view_vram');
   ok('view_vram GB tiles 128x192 @2x', images(r)[0]?.width === 256 && images(r)[0]?.height === 384);
-  r = await call('export_save', { path: 'harness/out/mcp-test/none.sav' });
-  ok('export_save errors when the game has no battery', r.isError && /no battery save/.test(textOf(r)));
+  r = await call('battery_save', { action: 'export', path: 'harness/out/mcp-test/none.sav' });
+  ok('battery_save export errors when the game has no battery', r.isError && /no battery save/.test(textOf(r)));
 
   // --- Battery saves ---
   await call('load_rom', { rom: saveRom });
   await call('wait_frames', { frames: 10 });
   const sav = Buffer.alloc(8192); sav[0] = 0x42;
   await writeFile(path.join(OUT, 'in.sav'), sav);
-  r = await call('import_save', { path: 'harness/out/mcp-test/in.sav' });
-  ok('import_save resets the game', !r.isError && r.structuredContent.frame === 1, textOf(r));
+  r = await call('battery_save', { action: 'import', path: 'harness/out/mcp-test/in.sav' });
+  ok('battery_save import resets the game', !r.isError && r.structuredContent.frame === 1, textOf(r));
   r = await call('read_memory', { address: '0xC000', length: 1, as: 'u8' });
   ok('game booted with the imported save', r.structuredContent.values[0] === 0x42, textOf(r));
-  r = await call('export_save', { path: 'harness/out/mcp-test/out.sav' });
+  r = await call('battery_save', { action: 'export', path: 'harness/out/mcp-test/out.sav' });
   const outSav = await readFile(path.join(OUT, 'out.sav'));
-  ok('export_save has what the game wrote', !r.isError && outSav.length === 8192 && outSav[1] === 0x43, `A001=${outSav[1]}`);
+  ok('battery_save export has what the game wrote', !r.isError && outSav.length === 8192 && outSav[1] === 0x43, `A001=${outSav[1]}`);
   r = await call('reset');
   r = await call('read_memory', { address: '0xC000', length: 1, as: 'u8' });
   ok('reset keeps the battery save', r.structuredContent.values[0] === 0x42);
@@ -261,7 +277,7 @@ try {
   r = await call('read_memory', { address: '0xC0D0', length: 1, as: 'u8' });
   ok('GB GameShark cheat applies', r.structuredContent.values[0] === 0xaa, textOf(r));
   r = await call('status');
-  ok('status lists cheats', r.structuredContent.cheats.length === 1);
+  ok('status counts cheats', r.structuredContent.cheats === 1);
 
   // --- A/B compare ---
   const steps = [{ wait: 20 }, { shot: 'a' }, { read: '0xC000' }];
@@ -274,6 +290,17 @@ try {
 } finally {
   await client.close();
   await close();
+}
+
+// --- GBTEST_TOOLS subsets ---
+for (const [spec, expect] of /** @type {Array<[string, number]>} */ ([['core', 11], ['core,ram_search', 12], ['screenshot,status', 2]])) {
+  const sub = createServer({ tools: spec });
+  const c = new Client({ name: 'test', version: '0' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  await Promise.all([sub.server.connect(b), c.connect(a)]);
+  const n = (await c.listTools()).tools.length;
+  ok(`tools="${spec}" exposes ${expect} tools`, n === expect, `${n}`);
+  await c.close();
 }
 
 process.exit(failed ? 1 : 0);
