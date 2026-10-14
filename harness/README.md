@@ -7,13 +7,16 @@ core automatically from the ROM extension, and exposes it two ways:
 
 - **MCP server** (`mcp-server.mjs`) — any MCP host (Claude Code, Claude Desktop,
   Cursor, …) gets tools to load a ROM, press buttons, **see the screen** (inline
-  images), read and write real RAM, and assert against golden frames. This is the
-  main way an AI drives it.
+  images), read and write real RAM, **search RAM** for a value, run whole input
+  scripts in one call, and assert against golden frames. This is the main way an AI
+  drives it.
 - **Node library** (`driver.mjs`) — the same capabilities as a scriptable class,
   for CI and custom test scripts.
 
-Everything is **deterministic** (verified bit-identical across runs) and reads/writes
-**real RAM** out of save states — no core rebuild needed.
+Everything is **deterministic** (verified bit-identical across runs), **fast**
+(long waits fast-forward, still bit-identical), **frame-exact** (the emulator is
+paused between calls), **fully offline** (any external request is blocked and
+reported), and reads/writes **real RAM** out of save states — no core rebuild needed.
 
 ## Setup (once)
 
@@ -26,9 +29,18 @@ npm install          # installs deps + Chromium (postinstall)
 
 It runs over **stdio** (`npm run mcp`), so any MCP host launches it with
 `command: "node"` and the absolute path to `mcp-server.mjs`. Requires Node 18+; the
-first `npm install` downloads headless Chromium. ROM paths in tool calls resolve
-relative to the server's working directory (`harness/`), so absolute ROM paths are
-safest.
+first `npm install` downloads headless Chromium.
+
+**Relative paths** in tool calls (ROMs, goldens, state files, screenshot saves)
+resolve against, in order: the `GBTEST_ROOT` env var, the host's first workspace
+root (MCP *roots*), or the server's working directory. Tool results always echo the
+resolved absolute path.
+
+| Env var | Effect |
+|---------|--------|
+| `GBTEST_ROOT` | Base directory for relative paths. |
+| `GBTEST_CHROMIUM` | Use this Chromium/Chrome binary instead of Playwright's download. |
+| `UPDATE_GOLDENS=1` | Re-create goldens instead of comparing. |
 
 > **Config key differs by host:** VS Code uses `"servers"`; Claude Desktop, Cursor,
 > Windsurf, and Antigravity use `"mcpServers"`. The inner server entry is identical.
@@ -79,31 +91,57 @@ Claude Code).
 
 ### Tools & prompts
 
-Once connected, the agent has these tools: `load_rom` (`.gba/.gb/.gbc`, system auto-detected),
-`wait_frames`, `press`, `set_button`, `screenshot` (returns the frame as an image),
-`read_memory`, `write_memory`, `save_state`, `load_state`, `assert_golden`,
-`frame_number`, `reset`, `status`. ROM paths are resolved relative to the server's
-working directory.
+| Tool | What it does |
+|------|--------------|
+| `load_rom` | Boot a `.gba/.gb/.gbc` (system auto-detected). Reuses the browser, so switching ROMs takes ~2 s. `fast` (default on) fast-forwards long waits. |
+| `wait_frames` | Advance N frames (60 ≈ 1 s). |
+| `press` | Tap one `button` or a combo `buttons: ["A","B"]` (hold / release frames). |
+| `set_button` | Hold/release button(s) without advancing time. |
+| `screenshot` | Current frame inline, **upscaled 3× by default** (`scale` 1–4) so it's legible; `save` writes the native PNG. |
+| `read_memory` | Read RAM. `address` may be a number or a hex string (`"0x03000010"`, `"$C000"`); typed `as` returns every value in the range. |
+| `write_memory` | Poke RAM on the current frame (`value`+`as` or `hex`); reports whether it stuck. |
+| `save_state` / `load_state` | Named snapshots; optional `path` saves/loads a file that survives restarts. |
+| `assert_golden` | Compare to a golden PNG (created on first run). On failure returns **current, golden and diff images inline**. |
+| `run_sequence` | Run a whole script of steps in **one call** (waits, taps, holds, shots, recordings as a contact sheet, RAM reads/writes/asserts, golden asserts) and get the timeline + images back. |
+| `ram_search_start` / `ram_search_filter` / `ram_search_results` | Cheat-search: find where the game keeps a value (eq / changed / increased / decreased / delta …) in a few calls. |
+| `frame_number`, `reset`, `status` | Housekeeping. |
+
+Tools carry MCP annotations (`readOnlyHint` etc.) and structured output schemas.
+Calls are serialized, so a host issuing tools in parallel can't interleave them.
+**Resources:** `emu://screen` (current frame PNG) and `emu://status` (JSON).
 
 **Console support:** GBA (mgba) and GB/GBC (gambatte) — everything works for all
-three: input, screenshots, save states, determinism, golden asserts, **and RAM
-read/write**. `read_memory`/`write_memory` interpret the address for whichever
-console is loaded.
+three: input, screenshots, save states, determinism, golden asserts, RAM
+read/write and RAM search. Addresses are interpreted for whichever console is loaded.
 
-**Prompts (guided workflows).** The server also ships MCP *prompts* — pick one in
-your host and it walks the agent through a multi-step job using the tools:
+**Prompts (guided workflows).** Pick one in your host and it walks the agent through
+a multi-step job using the tools:
 - `smoke_test_rom` — boot a ROM and judge whether it actually runs (renders vs.
-  black/crash/hang).
-- `regression_check` — play a scripted sequence and `assert_golden` at checkpoints.
-- `find_ram_address` — value-search to discover the address of an in-game value
-  (HP, score…), then verify it with a write — turns the memory tools from "if you
-  know the address" into "find it yourself".
+  black/crash/hang) and responds to input.
+- `regression_check` — play a scripted sequence (one `run_sequence`) and
+  `assert_golden` at checkpoints.
+- `find_ram_address` — discover the address of an in-game value (HP, score…) with
+  the RAM search tools, then verify it with a write.
+
+### Example: finding HP with RAM search
+
+(Addresses and counts are illustrative.)
+
+```
+ram_search_start  { "type": "u8", "value": 10 }        -> 812 candidates
+(take a hit in game)
+ram_search_filter { "op": "eq", "value": 9 }            -> 3 candidates
+(take another hit)
+ram_search_filter { "op": "delta", "value": -1 }        -> 1 candidate: 0x03001a4c = 8
+write_memory      { "address": "0x03001a4c", "value": 99 }   # verify on screen
+```
 
 ## Quick check
 
 ```bash
 node driver.mjs shot ../anguna.gba 300 out/title.png   # boot, run 300 frames, screenshot
-node tests/smoke.mjs                                    # full self-test (boot + render + state round-trip)
+node tests/smoke.mjs                                    # boot + render + state round-trip
+npm test                                                # full suite (incl. the MCP layer)
 ```
 
 ## Writing a test
@@ -129,25 +167,32 @@ await emu.close();
 `launch(rom)` accepts any path; ROMs outside this folder are copied into `out/` so
 the local static server can serve them.
 
+The machine is **paused between calls** and only runs inside `waitFrames` /
+`waitUntilFrame` / `tap`, so a screenshot, RAM read or write always lands on exactly
+the frame `frameNum()` reports, no matter how long your script takes in between.
+
 ## API
 
 | Method | Description |
 |--------|-------------|
-| `EmuHarness.launch(rom, {headless=true, timeout=60000})` | Boot a ROM, resolve once the game has started. |
+| `EmuHarness.launch(rom, {headless=true, timeout=60000, fast=true, reuse=false})` | Boot a ROM, resolve once the game has started. `fast`: fast-forward long waits (bit-identical). `reuse`: share one browser + server between harnesses (`close()` then only closes the page). |
+| `EmuHarness.shutdown()` | Close the shared browser used by `reuse: true` harnesses. |
 | `waitFrames(n)` | Advance **n emulated frames** on a boot-anchored absolute clock (see Determinism). |
 | `waitUntilFrame(abs)` | Advance to an absolute emulated frame number. |
 | `frameNum()` | Current emulated frame number (absolute, from boot). |
 | `setButton(name, pressed)` | Hold/release a button. Names: `A B L R START SELECT UP DOWN LEFT RIGHT`. |
-| `tap(name, hold=4, release=4)` | Press, hold `hold` frames, release, settle `release` frames. |
-| `screenshot(outPath?)` | PNG of the current frame → `Buffer` (and written to `outPath` if given). |
+| `setButtons(names, pressed)` / `heldButtons()` | Several buttons at once / which are held. |
+| `tap(name \| names[], hold=4, release=4)` | Press (one button or a combo), hold `hold` frames, release, settle `release` frames. |
+| `screenshot(outPath?)` | PNG of the current frame → `Buffer` (and written to `outPath` if given). `lastScreenshotStale` is `true` if the picture is unknown (see below). |
 | `saveState()` / `loadState(buf)` | Capture / restore a full save state (`Buffer`). |
 | `readMemory(addr, len)` | Read `len` bytes at a bus address (GBA or GB/GBC) → `Buffer`. |
 | `readU8/readU16/readU32(addr)` | Read a little-endian integer at a bus address. |
 | `readRegions()` | Typed RAM views (GBA: `ewram/iwram/vram/pram/oam/io`; GB: `wram/vram/sram/hram/io`). |
-| `writeMemory(addr, buf)` | Set-up poke: patch RAM via save state (see caveats below). |
+| `writeMemory(addr, buf)` | Poke RAM on the current frame via save state; returns whether it stuck (see below). |
 | `writeU8/writeU16/writeU32(addr, v)` | Write a little-endian integer at a bus address. |
 | `hasMemoryAccess()` | `true` only if the core exports *live* RAM (not required for reads). |
 | `videoDimensions()` | `{ w, h }` — `240x160` (GBA) or `160x144` (GB/GBC). |
+| `stats()` | Fast-forward counters `{ ffWaits, recoveries, restoreRetries }`. |
 | `restart()` | Reset the game. |
 | `close()` | Shut down the browser and static server. |
 
@@ -159,9 +204,12 @@ Author a test as plain JSON steps and dump a screenshot timeline the AI reads ba
 node runner.mjs tests/anguna.script.json          # -> out/anguna.script/*.png + timeline.json
 ```
 
-Step types: `wait` (frames), `tap`/`press`/`release`/`hold` (buttons), `shot` (named
-screenshot), `record` (`{frames, every, prefix}` — periodic screenshots), `saveState`/
-`loadState` (named, in-memory), and `assert` (golden compare). Example:
+Step types: `wait` (frames), `tap`/`press`/`release`/`hold` (a button or an array of
+buttons), `shot` (named screenshot), `record` (`{frames, every, prefix}` — periodic
+screenshots), `saveState`/`loadState` (named, in-memory), `read` / `write` /
+`assertRam` (RAM by address, e.g. `{"assertRam": "0x03000010", "as": "u16",
+"equals": 3}` or `min`/`max`), and `assert` (golden compare). The same steps drive
+the MCP `run_sequence` tool (`steps.mjs`). Example:
 
 ```json
 { "rom": "../mygame.gba", "steps": [
@@ -191,7 +239,8 @@ const res = await assertGolden(await emu.screenshot(), 'goldens/title.png', { th
 - First run (or `UPDATE_GOLDENS=1 node runner.mjs ...`) **creates/refreshes** goldens.
 - `threshold` is the max fraction of differing pixels (default 2%); `tolerance` is the
   per-channel value delta that counts as "different" (default 16, absorbs codec noise).
-- `assert` paths are resolved relative to the **script file's** directory.
+- In `runner.mjs` scripts, `rom` is relative to the working directory and `assert`
+  paths to the **script file's** directory.
 
 ## How it works
 
@@ -209,8 +258,21 @@ diff at matched checkpoints) and that input actually changes the frame.
 
 The one requirement is to step time on the **absolute clock**: `waitFrames(n)`
 accumulates targets anchored at boot (frame 0), so boot jitter can't shift which
-emulated frame you land on. Don't `sleep()` in wall-clock time between actions —
-always advance with `waitFrames`/`waitUntilFrame`. Goldens are also tied to this
+emulated frame you land on. Always advance with `waitFrames`/`waitUntilFrame`;
+wall-clock time between calls doesn't matter because the machine is paused.
+
+**Fast-forward.** The core can't be single-stepped, so a wait longer than 120 frames
+runs at 8× and drops to 1× 60 frames before the target, landing exactly on it. If a
+stall ever made fast-forward jump past the target, the wait is rewound from an
+in-page snapshot and redone at 1×. `tests/fastforward.mjs` checks that frames, RAM
+and frame numbers are identical to a pure 1× run (about 3× faster on the suite's
+scripts). Disable with `launch(rom, { fast: false })` / `load_rom { fast: false }`.
+
+**Screens and save states.** A save state doesn't contain the rendered picture.
+The harness remembers the picture of every state it hands out, so loading one
+restores its screen exactly. Loading a state file made in another session has no
+known picture: the screenshot is then flagged stale (`lastScreenshotStale`, or a
+note in the MCP result) until you advance one frame. Goldens are also tied to this
 software (SwiftShader) renderer; regenerate them with `UPDATE_GOLDENS=1` after a
 Chromium/Playwright upgrade.
 
@@ -232,6 +294,18 @@ const rg  = await emu.readRegions();              // { wram, vram, sram, hram, i
 
 Or via the MCP `read_memory` tool (`address`, `length`, `as: hex|u8|u16|u32|s8|s16|s32`).
 
+**Don't know the address?** `ramsearch.mjs` (MCP: `ram_search_*`) does a classic value
+search over GBA EWRAM+IWRAM or GB WRAM (every CGB bank)+HRAM+cart RAM:
+
+```js
+import { RamSearch } from './ramsearch.mjs';
+const s = new RamSearch(emu.system, await emu.readRegions(), { type: 'u8' });
+s.filter(await emu.readRegions(), 'eq', 10);   // HP is 10 now
+// ...take a hit...
+s.filter(await emu.readRegions(), 'delta', -1);
+s.results(); // [{ address: 0x03001a4c, region: 'iwram', value: 9, previous: 10 }]
+```
+
 **How it works (no core rebuild).** RAM is read out of the save state.
 - **GBA** — the mgba save state's `MEM ` chunk is a raw `GBASerializedState` (v7); the
   struct size is found *structurally* from the trailing extdata directory (verified
@@ -242,7 +316,7 @@ Or via the MCP `read_memory` tool (`address`, `length`, `as: hex|u8|u16|u32|s8|s
 
 Both compute offsets per state, so nothing is hardcoded per ROM or save type.
 
-## Writing RAM (set-up poke)
+## Writing RAM
 
 Set up a scenario without playing to it — e.g. start a test at low HP:
 
@@ -253,11 +327,11 @@ await emu.writeMemory(0xC000, Buffer.from([1,2])); // GB WRAM
 
 Or the MCP `write_memory` tool (`address` + `value`/`as`, or raw `hex`).
 
-**How it works & its limits.** It patches the RAM inside a save state and reloads it,
-then confirms the value took by reading back. Because the game keeps running, this is
-a *set-up* poke, not a live mid-frame cheat: a value the game recomputes every frame
-may be overwritten again immediately (the call reports what's actually there after).
-Values the game only changes through gameplay (HP, inventory, position) stick.
+**How it works & its limits.** It patches the RAM inside a save state of the paused
+machine and reloads it on the same frame, then confirms the value took by reading
+back (the MCP tool warns if it didn't). The next frame runs game code as usual, so a
+value the game recomputes every frame is overwritten again on the next frame; values
+the game only changes through gameplay (HP, inventory, position) stick.
 Frame-accurate live poke would need a core built with the libretro memory exports;
 `readSystemRam()`/`hasMemoryAccess()` auto-detect such a core if you ever drop one in,
 but it isn't required for reads or set-up writes.

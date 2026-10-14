@@ -50,27 +50,113 @@
     const gm = () => window.EJS_emulator.gameManager;
 
     Emu.ready = () => Emu._startPromise;
-    Emu.frameNum = () => gm().getFrameNum(); // absolute, boot-referenced
+    // Logical frame clock = the core's counter minus an offset. The offset only moves
+    // when fast-forward overshoot recovery rewinds the machine (the counter itself
+    // never rewinds), so frameNum() always names the emulated frame you're on.
+    Emu._offset = 0;
+    Emu.frameNum = () => gm().getFrameNum() - Emu._offset; // absolute, boot-referenced
     Emu.videoDimensions = () => ({ w: gm().getVideoDimensions('width'), h: gm().getVideoDimensions('height') });
 
-    Emu.setButton = (name, pressed) => {
-      const id = BUTTONS[String(name).toUpperCase()];
+    const pressed = new Set();
+    Emu.setButton = (name, down) => {
+      const key = String(name).toUpperCase();
+      const id = BUTTONS[key];
       if (id === undefined) throw new Error('Unknown button: ' + name);
-      gm().simulateInput(0, id, pressed ? 32767 : 0);
+      gm().simulateInput(0, id, down ? 32767 : 0);
+      if (down) pressed.add(key); else pressed.delete(key);
+    };
+    Emu.setButtons = (names, down) => { for (const n of names) Emu.setButton(n, down); };
+    Emu.heldButtons = () => [...pressed];
+
+    // ---- Fast-forward (deterministic) ----
+    // The core can't be single-stepped, so long waits run in fast-forward and drop
+    // back to 1x FF_MARGIN frames before the target; at 1x the core advances at most
+    // one frame per animation frame, so we land exactly on the target. If a stall
+    // ever makes fast-forward jump past the target anyway, we restore an in-page
+    // snapshot taken at the start of the wait and redo it at 1x — so results are
+    // bit-identical to a pure 1x run either way. Disable with ?fast=0.
+    Emu.fast = params.get('fast') !== '0';
+    const FF_RATIO = 8, FF_MARGIN = 60;
+    Emu.stats = { ffWaits: 0, recoveries: 0, restoreRetries: 0 };
+    Emu._forceOvershoot = false; // test hook: pretend the next fast-forward overshot
+    let ffOn = false;
+    const setFF = (on) => {
+      if (on === ffOn) return;
+      ffOn = on;
+      if (on) gm().setFastForwardRatio(FF_RATIO);
+      gm().toggleFastForward(on ? 1 : 0);
     };
 
-    // Poll the core's own frame counter until it reaches an absolute target.
-    // A wall-clock timeout guards against a paused/stalled main loop.
-    function waitUntil(targetFrame, timeoutMs = 30000) {
-      return new Promise((res, rej) => {
-        const t0 = performance.now();
-        (function check() {
-          if (gm().getFrameNum() >= targetFrame) return res(gm().getFrameNum());
-          if (performance.now() - t0 > timeoutMs)
-            return rej(new Error(`waitFrames timeout: frame ${gm().getFrameNum()} < target ${targetFrame}`));
-          requestAnimationFrame(check);
-        })();
-      });
+    // The core is PAUSED between calls and only runs inside a wait, so every
+    // screenshot / RAM read / write lands on exactly the frame the clock says —
+    // not wherever wall-clock time has drifted to since the last call.
+    Emu._running = true;
+    Emu.pause = () => { if (Emu._running) { gm().toggleMainLoop(0); Emu._running = false; } };
+    Emu.resume = () => { if (!Emu._running) { gm().toggleMainLoop(1); Emu._running = true; } };
+
+    const raf = () => new Promise((r) => requestAnimationFrame(r));
+
+    // Swap the machine state while keeping the logical clock on `frame`. A load is
+    // queued and applied by a later main-loop iteration; depending on frame pacing
+    // that iteration may or may not also run a core frame, so after it we compare
+    // the machine to the requested state and retry until it matches exactly.
+    // (A handful of header bytes — a host timestamp — always differ, hence NOISE.)
+    const NOISE = 16;
+    const sameState = (a, b) => {
+      if (a.length !== b.length) return false;
+      let n = 0;
+      for (let i = 0; i < a.length; i++) if (a[i] !== b[i] && ++n > NOISE) return false;
+      return true;
+    };
+    const restore = async (u8, frame) => {
+      setFF(false);
+      for (let attempt = 0; attempt < 10; attempt++) {
+        gm().loadState(u8);
+        const c = gm().getFrameNum();
+        Emu.resume();
+        while (gm().getFrameNum() <= c) await raf();
+        Emu.pause();
+        if (sameState(gm().getState(), u8)) { Emu._offset = gm().getFrameNum() - frame; Emu._fbValid = false; return; }
+        Emu.stats.restoreRetries++;
+      }
+      throw new Error('could not restore the save state exactly');
+    };
+
+    // Run until the clock reaches an absolute target, then pause. A wall-clock
+    // timeout (scaled to the distance, so long 1x waits don't trip it) guards
+    // against a stalled main loop.
+    async function waitUntil(targetFrame) {
+      if (Emu.frameNum() >= targetFrame) { Emu.pause(); return Emu.frameNum(); }
+      const timeoutMs = 30000 + (targetFrame - Emu.frameNum()) * (1000 / 60) * 2;
+      const t0 = performance.now();
+      let snap = null, snapFrame = 0;
+      if (Emu.fast && targetFrame - Emu.frameNum() > FF_MARGIN * 2) {
+        snapFrame = Emu.frameNum();
+        snap = gm().getState();
+        Emu.stats.ffWaits++;
+      }
+      Emu.resume();
+      if (snap) setFF(true);
+      for (;;) {
+        let f = Emu.frameNum();
+        if (snap && (f > targetFrame || (Emu._forceOvershoot && ffOn && f > snapFrame))) {
+          // Overshot: rewind to the snapshot and finish this wait at 1x.
+          Emu._forceOvershoot = false;
+          Emu.stats.recoveries++;
+          await restore(snap, snapFrame);
+          snap = null;
+          Emu.resume();
+          f = Emu.frameNum();
+        }
+        if (ffOn && targetFrame - f <= FF_MARGIN) setFF(false);
+        if (f >= targetFrame && !ffOn) { Emu.pause(); Emu._advanced(); return f; }
+        if (performance.now() - t0 > timeoutMs) {
+          setFF(false);
+          Emu.pause();
+          throw new Error(`waitFrames timeout: frame ${f} < target ${targetFrame}`);
+        }
+        await raf();
+      }
     }
 
     // Deterministic clock: targets accumulate on ONE absolute timeline anchored at
@@ -80,11 +166,13 @@
     Emu.waitFrames = (n) => { Emu._target += n; return waitUntil(Emu._target); };
     Emu.waitUntilFrame = (abs) => { if (abs > Emu._target) Emu._target = abs; return waitUntil(abs); };
 
-    // Press a button, hold it for holdFrames, release, then settle for releaseFrames.
+    // Press button(s), hold for holdFrames, release, then settle for releaseFrames.
+    // `name` may be one button or an array pressed together (e.g. ['A','B']).
     Emu.tap = async (name, holdFrames = 4, releaseFrames = 4) => {
-      Emu.setButton(name, true);
+      const names = Array.isArray(name) ? name : [name];
+      Emu.setButtons(names, true);
       await Emu.waitFrames(holdFrames);
-      Emu.setButton(name, false);
+      Emu.setButtons(names, false);
       await Emu.waitFrames(releaseFrames);
     };
 
@@ -102,20 +190,77 @@
       return u8;
     };
 
-    Emu.screenshot = async () => u8ToB64(await gm().screenshot()); // PNG -> base64
-    Emu.saveState = async () => u8ToB64(await gm().getState());     // savestate -> base64
-    // A save state includes the frame counter, so loading it rewinds getFrameNum.
-    // Give the core a few frames to actually apply the load, then re-anchor the
-    // deterministic frame clock so later waitFrames() calls stay correct.
-    Emu.loadState = (b64) => new Promise((res) => {
-      gm().loadState(b64ToU8(b64));
-      let n = 0;
-      (function tick() {
-        if (n++ >= 4) { Emu._target = gm().getFrameNum(); return res(); }
-        requestAnimationFrame(tick);
-      })();
-    });
-    Emu.restart = () => gm().restart();
+    // ---- Screen tracking ----
+    // A save state doesn't contain the rendered picture, and every restore runs one
+    // main-loop iteration of the OLD timeline, so after a restore the core's
+    // framebuffer is stale. We therefore track the screen explicitly:
+    //  - _fbValid: the framebuffer shows the current frame (true right after a wait)
+    //  - _screen:  cached PNG of the current frame (survives restores that don't
+    //              change what's on screen, e.g. RAM pokes)
+    //  - shotByState: PNGs of states handed out by saveState(), so loading one of
+    //              them restores its picture too.
+    Emu._fbValid = true;
+    Emu._screen = null;
+    const shotByState = new Map(); // hash -> png b64 (bounded)
+    const hashState = (u8) => {
+      let h = 0x811c9dc5;
+      for (let i = 0; i < u8.length; i++) h = Math.imul(h ^ u8[i], 16777619);
+      return (h >>> 0).toString(16) + ':' + u8.length;
+    };
+    Emu._advanced = () => { Emu._fbValid = true; Emu._screen = null; };
+
+    // The core only renders a screenshot from inside its main loop, so while paused
+    // we run it just long enough to capture, then restore the exact pre-capture state.
+    async function captureScreen() {
+      const snap = gm().getState(), f = Emu.frameNum();
+      Emu.resume();
+      try { return u8ToB64(await gm().screenshot()); } // PNG -> base64
+      finally { Emu.pause(); await restore(snap, f); }
+    }
+    /** -> { png: base64, stale: bool }. stale = the picture for this exact state is
+     *  unknown (e.g. right after loading an external save state) and the image is the
+     *  last frame the core rendered; advance >= 1 frame for a true picture. */
+    Emu.screenshot = async () => {
+      if (Emu._running) return { png: u8ToB64(await gm().screenshot()), stale: false };
+      if (Emu._screen) return { png: Emu._screen, stale: false };
+      const stale = !Emu._fbValid;
+      const png = await captureScreen();
+      if (!stale) Emu._screen = png;
+      return { png, stale };
+    };
+    const ensureScreen = async () => { if (!Emu._screen && Emu._fbValid) Emu._screen = await captureScreen(); };
+
+    // Raw machine state (for RAM reads; no screen bookkeeping).
+    Emu.rawState = async () => u8ToB64(await gm().getState());
+    // Public save state: also remembers the picture so loading it restores the screen.
+    Emu.saveState = async () => {
+      await ensureScreen();
+      const u8 = gm().getState();
+      if (Emu._screen) {
+        if (shotByState.size >= 64) shotByState.delete(shotByState.keys().next().value);
+        shotByState.set(hashState(u8), Emu._screen);
+      }
+      return u8ToB64(u8);
+    };
+    // The logical clock keeps counting from where it is (a state doesn't carry the
+    // frontend's frame counter); re-anchor the deterministic target so later
+    // waitFrames() calls stay correct.
+    Emu.loadState = async (b64) => {
+      Emu.pause();
+      const u8 = b64ToU8(b64);
+      await restore(u8, Emu.frameNum());
+      Emu._target = Emu.frameNum();
+      Emu._fbValid = false;
+      Emu._screen = shotByState.get(hashState(u8)) || null;
+    };
+    // Load a patched copy of the CURRENT state (RAM poke): what's on screen is unchanged.
+    Emu.pokeState = async (b64) => {
+      Emu.pause();
+      await ensureScreen();
+      await restore(b64ToU8(b64), Emu.frameNum());
+      Emu._fbValid = false;
+    };
+    Emu.restart = () => { gm().restart(); Emu._fbValid = false; Emu._screen = null; };
 
     // Live system RAM, IF the loaded core exports the libretro memory API.
     // The bundled mgba core does NOT (returns null); a core rebuilt with

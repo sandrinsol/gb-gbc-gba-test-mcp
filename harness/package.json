@@ -1,6 +1,6 @@
 {
   "name": "gb-gbc-gba-test-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "MCP server + headless harness to test Game Boy / Color / Advance games in EmulatorJS (mgba + gambatte): input, screenshots, save states, deterministic playback, and real RAM read/write — no third-party emulator.",
   "keywords": ["mcp", "gba", "gb", "gbc", "gameboy", "emulator", "mgba", "gambatte", "emulatorjs", "testing", "ai", "game-testing"],
@@ -20,7 +20,10 @@
     "gb-determinism": "node tests/gb-determinism.mjs",
     "gb-cgb": "node tests/gb-cgb.mjs",
     "write": "node tests/write.mjs",
-    "test": "node tests/smoke.mjs && node tests/determinism.mjs && node tests/memory.mjs && node tests/write.mjs && node tests/gb.mjs && node tests/gb-determinism.mjs && node tests/gb-cgb.mjs"
+    "fastforward": "node tests/fastforward.mjs",
+    "test": "node tests/smoke.mjs && node tests/determinism.mjs && node tests/memory.mjs && node tests/write.mjs && node tests/gb.mjs && node tests/gb-determinism.mjs && node tests/gb-cgb.mjs && node tests/fastforward.mjs && node tests/ramsearch.mjs && node tests/mcp.mjs",
+    "mcp-test": "node tests/mcp.mjs",
+    "ramsearch": "node tests/ramsearch.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

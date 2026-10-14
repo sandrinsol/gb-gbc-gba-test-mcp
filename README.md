@@ -94,7 +94,8 @@ data/
   cores/
     mgba-wasm.data           GBA core (WebGL2)
     mgba-legacy-wasm.data     GBA core (fallback)
-    cores.json, reports/mgba.json
+    gambatte-wasm.data        GB/GBC core (WebGL2)
+    cores.json, reports/      per-core build reports (tell EmulatorJS to use the bundled WebGL2 builds)
   compression/        7z/zip/rar workers for unpacking the core
 ```
 

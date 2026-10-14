@@ -101,3 +101,40 @@ export function encodePng({ width, height, data }) {
     chunk('IEND', Buffer.alloc(0)),
   ]);
 }
+
+/** Nearest-neighbour upscale a PNG by an integer factor (pixel-exact, no blur) so
+ *  small console frames are legible to vision models. Returns a PNG buffer. */
+export function scalePng(buf, factor = 1) {
+  if (factor === 1) return buf;
+  const src = decodePng(buf);
+  const w = src.width * factor, h = src.height * factor;
+  const out = new Uint8Array(w * h * 3);
+  for (let y = 0; y < h; y++) {
+    const sy = (y / factor) | 0;
+    for (let x = 0; x < w; x++) {
+      const si = (sy * src.width + ((x / factor) | 0)) * src.channels, o = (y * w + x) * 3;
+      out[o] = src.data[si]; out[o + 1] = src.data[si + 1]; out[o + 2] = src.data[si + 2];
+    }
+  }
+  return encodePng({ width: w, height: h, data: out });
+}
+
+/** Tile same-sized PNG frames into one grid image (a "contact sheet"), so a whole
+ *  animation can be seen in a single image. `gap` px of dark grey between tiles. */
+export function contactSheet(bufs, { cols = 4, gap = 2, scale = 1 } = {}) {
+  const frames = bufs.map(decodePng);
+  const fw = frames[0].width, fh = frames[0].height;
+  cols = Math.max(1, Math.min(cols, frames.length));
+  const rows = Math.ceil(frames.length / cols);
+  const w = cols * fw + (cols - 1) * gap, h = rows * fh + (rows - 1) * gap;
+  const out = new Uint8Array(w * h * 3).fill(40);
+  frames.forEach((f, i) => {
+    if (f.width !== fw || f.height !== fh) throw new Error('contactSheet: frames differ in size');
+    const ox = (i % cols) * (fw + gap), oy = Math.floor(i / cols) * (fh + gap);
+    for (let y = 0; y < fh; y++) for (let x = 0; x < fw; x++) {
+      const si = (y * fw + x) * f.channels, o = ((oy + y) * w + ox + x) * 3;
+      out[o] = f.data[si]; out[o + 1] = f.data[si + 1]; out[o + 2] = f.data[si + 2];
+    }
+  });
+  return scalePng(encodePng({ width: w, height: h, data: out }), scale);
+}

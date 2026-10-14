@@ -26,6 +26,7 @@ jobs:
 
       - run: npx playwright install --with-deps chromium
 
-      # Boots the mgba core headlessly (software WebGL via SwiftShader) and runs
-      # the smoke, determinism/input, and memory-read tests.
+      # Boots the mgba + gambatte cores headlessly (software WebGL via SwiftShader)
+      # and runs the full suite: smoke, determinism/input, fast-forward, RAM
+      # read/write/search, GB/GBC, and the MCP server end to end.
       - run: npm test
