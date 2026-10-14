@@ -18,7 +18,8 @@ D-pad, plus a test that checks both.
 
 Text is drawn with sprites, so `describe` lists it as sprites rather than reading
 it; use a screenshot to read it. `gbtest.json` sets the build, the variables to
-report after each step (`watch`) the frame counter (for lag checks) and the CPU load variable.
+report after each step (`watch`), the frame counter (for lag checks) and the CPU load
+variable (`cpuUsage`).
 
 The goldens in `tests/gb/goldens/` are created on the first run; delete them when
 you change what the screen should look like.
