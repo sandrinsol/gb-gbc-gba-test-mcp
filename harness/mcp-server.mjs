@@ -1071,10 +1071,10 @@ export async function main() {
 }
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
 if (isMain && process.argv[2] === 'new') {
-  // gb-gbc-gba-test-mcp new <template> <dir>
+  // node mcp-server.mjs new <template> <dir>
   const [, , , template, dir] = process.argv;
   if (!template || !dir) {
-    console.error(`usage: gb-gbc-gba-test-mcp new <template> <dir>\ntemplates: ${Object.entries(TEMPLATES).map(([k, v]) => `\n  ${k.padEnd(7)} ${v}`).join('')}`);
+    console.error(`usage: node mcp-server.mjs new <template> <dir>\ntemplates: ${Object.entries(TEMPLATES).map(([k, v]) => `\n  ${k.padEnd(7)} ${v}`).join('')}`);
     process.exit(1);
   }
   const files = await createProject(template, path.resolve(dir));
