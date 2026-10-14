@@ -105,3 +105,32 @@ jobs:
             (cd "templates/$t" && make GBDK="$RUNNER_TEMP/gbdk" && node ../../harness/runner.mjs tests/gb/smoke.json out/smoke)
             echo "::endgroup::"
           done
+
+  gba-templates:
+    name: GBA templates (devkitARM + libtonc, Butano)
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: npm ci --ignore-scripts
+        working-directory: harness
+
+      - run: npx playwright install --with-deps chromium
+        working-directory: harness
+
+      - name: Fetch Butano
+        run: git clone --depth 1 --branch 21.9.0 https://github.com/GValiente/butano "$RUNNER_TEMP/butano"
+
+      # Each template must build and pass its own test (golden images included).
+      - name: Build and test the templates
+        run: |
+          for t in gba-tonc gba-butano; do
+            echo "::group::$t"
+            (cd "templates/$t" && make -j4 BUTANO="$RUNNER_TEMP/butano" && node ../../harness/runner.mjs tests/gb/smoke.json out/smoke)
+            echo "::endgroup::"
+          done

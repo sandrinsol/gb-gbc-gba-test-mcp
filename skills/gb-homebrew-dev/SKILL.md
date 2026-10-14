@@ -10,9 +10,11 @@ VRAM/OAM rules come from there, not from memory.
 
 ## Start
 
-- New game: `new_project` with `gb-asm` (RGBDS), `gb-c` (GBDK-2020) or `gba-c`
-  (arm-none-eabi-gcc). It builds, runs and has a passing test from the start, plus
-  `gbtest.json`, a CI workflow and a dev container with the toolchains.
+- New game: `new_project` with `gb-asm` (RGBDS), `gb-c` (GBDK-2020), `gba-c`
+  (arm-none-eabi-gcc), `gba-tonc` (devkitARM + libtonc) or `gba-butano` (Butano,
+  C++). It builds, runs and has a passing test from the start, plus `gbtest.json`,
+  a CI workflow and a dev container with the toolchain. GBA projects: also read
+  the `gba-dev` skill (and `butano` for Butano).
 - Existing game: find the toolchain, and add a `gbtest.json` (below).
 
 | Signs | Toolchain | Build | Symbols |
@@ -45,13 +47,16 @@ is needed rather than guessing at installs.
 5. Keep what you verified as a test in `tests/gb/*.json` (see `gb-ci-tests`), and for
    bigger changes hand the result to the `gb-tester` agent to try to break it.
 
-Blank or frozen screen: `check` first; then `read_cpu` (where is it?), LCDC (GB
-0xFF40) / DISPCNT (GBA 0x04000000), and `view_vram` to see if the graphics loaded.
+Blank or frozen screen: `check` first; then `describe` with `io: true` (display and
+interrupt registers in words), `read_cpu` (where is it?), and on GBA `view_vram`
+`layers` (each background and the sprites on their own).
 
 ## Art
 
 - Sprites: `sprite` `convert` (sheet of `width`×`height` frames) to `out` source
-  (.c/.h/.s/.asm/.bin), preview with `inject`/`overlay`, `animation: "x.gif"`.
+  (.c/.h/.s/.asm/.bin, or `.bmp` + `.json` for Butano), preview with
+  `inject`/`overlay`, `animation: "x.gif"`. GBA: `compress: "lz77"` for the BIOS
+  decompressor.
 - Backgrounds and maps: `background` with `png`, or `tiled` (a Tiled .tmx/.tmj map).
   Duplicate and mirrored tiles are merged, palettes packed; the preview image is
   rebuilt from the output, so if it looks right the data is right.

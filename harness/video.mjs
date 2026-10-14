@@ -164,3 +164,20 @@ export function gbTilesPng(regions, { bank = 0, palette = 0, cgb = false } = {})
     return ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
   }, colors);
 }
+
+/** GB/GBC display and interrupt registers as short lines of text. */
+export function gbIoLines(regions, cpu) {
+  const io = regions.io, lcdc = io[0x40], stat = io[0x41];
+  const map = (b) => (b ? '0x9C00' : '0x9800');
+  const pal = (v) => [0, 1, 2, 3].map((c) => (v >> (c * 2)) & 3).join('');
+  const IRQ = ['vblank', 'stat', 'timer', 'serial', 'joypad'];
+  const irqs = (bits) => IRQ.filter((_, i) => bits & (1 << i)).join(', ') || 'none';
+  const lines = [
+    `LCDC 0x${lcdc.toString(16)}: LCD ${lcdc & 0x80 ? 'on' : 'OFF'} · BG ${lcdc & 1 ? 'on' : 'off'} map ${map(lcdc & 8)} tiles ${lcdc & 0x10 ? '0x8000' : '0x8800 (signed)'} · window ${lcdc & 0x20 ? `on map ${map(lcdc & 0x40)} at ${io[0x4b] - 7},${io[0x4a]}` : 'off'} · sprites ${lcdc & 2 ? 'on' : 'off'} ${lcdc & 4 ? '8x16' : '8x8'}`,
+    `scroll ${io[0x43]},${io[0x42]} · LY ${io[0x44]} LYC ${io[0x45]} · STAT mode ${stat & 3}${stat & 0x78 ? ` irq on ${['HBlank', 'VBlank', 'OAM', 'LYC'].filter((_, i) => stat & (8 << i)).join('+')}` : ''}`,
+    `palettes (colour 0-3 → shade): BGP ${pal(io[0x47])} OBP0 ${pal(io[0x48])} OBP1 ${pal(io[0x49])}`,
+    `interrupts: IME ${cpu.ime ? 'on' : 'OFF'} · enabled ${irqs(regions.hram?.[0x1ff] ?? 0)} · pending ${irqs(io[0x0f])}${cpu.halted ? ' · CPU halted' : ''}`,
+  ];
+  if (regions.isCgbWram) lines.push(`GBC: ${io[0x4d] & 0x80 ? 'double' : 'normal'} speed · VRAM bank ${io[0x4f] & 1} · WRAM bank ${io[0x70] & 7 || 1}`);
+  return lines;
+}
