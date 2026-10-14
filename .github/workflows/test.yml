@@ -61,3 +61,47 @@ jobs:
       # npm pack -> install into an empty project -> drive a ROM through the bin.
       - if: matrix.os == 'ubuntu-latest' && matrix.node == 22
         run: npm run package-test
+
+  templates:
+    name: templates (build + test with RGBDS, GBDK, arm-none-eabi-gcc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: harness/package-lock.json
+
+      - run: npm ci --ignore-scripts
+        working-directory: harness
+
+      - name: Playwright version
+        id: pw
+        working-directory: harness
+        run: echo "version=$(node -p "require('./package-lock.json').packages['node_modules/playwright'].version")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
+      - run: npx playwright install --with-deps chromium
+        working-directory: harness
+
+      - name: Install the toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi binutils-arm-none-eabi
+          curl -sSL https://github.com/gbdev/rgbds/releases/download/v0.9.1/rgbds-0.9.1-linux-x86_64.tar.xz | sudo tar -xJ -C /usr/local/bin rgbasm rgblink rgbfix rgbgfx
+          curl -sSL https://github.com/gbdk-2020/gbdk-2020/releases/download/4.3.0/gbdk-linux64.tar.gz | tar -xz -C "$RUNNER_TEMP"
+
+      # Each template must build and pass its own test (golden images included).
+      - name: Build and test the templates
+        run: |
+          for t in gb-asm gb-c gba-c; do
+            echo "::group::$t"
+            (cd "templates/$t" && make GBDK="$RUNNER_TEMP/gbdk" && node ../../harness/runner.mjs tests/gb/smoke.json out/smoke)
+            echo "::endgroup::"
+          done

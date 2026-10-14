@@ -9,7 +9,10 @@
 //   change   write_memory, save_state, load_state, set_cheats, battery_save
 //   test     run_sequence, assert_golden, export_script, ab_compare, record_video
 //   find     ram_search
-//   make     sprite (convert art, inject into the game, overlay, export)
+//   make     sprite (convert art, inject into the game, overlay, export), background
+//   develop  build (compile + reload), describe (screen as text), watch, check
+// Addresses can be symbol names when the ROM has a symbol file (.sym/.noi/.elf/.map).
+// A gbtest.json in the workspace sets project defaults (build, rom, charmap, watch).
 // The machine is paused between calls, so every read lands on an exact frame.
 //
 // Token budget: every tool definition is resent with each request, so they are
@@ -33,8 +36,13 @@ import { scalePng, contactSheet } from './png.mjs';
 import { saveVideo } from './recording.mjs';
 import { convertSprite, writeSpriteSource, injectSprite, overlayFrame, framePng, spriteLimitWarnings } from './sprite.mjs';
 import { RamSearch, SEARCH_OPS, SEARCH_TYPES } from './ramsearch.mjs';
-import { runSteps, parseAddress, decodeValues, encodeValue, VALUE_TYPES } from './steps.mjs';
+import { runSteps, decodeValues, encodeValue, VALUE_TYPES } from './steps.mjs';
 import { gbaSprites, gbSprites, drawBoxes, gbaPalettes, gbPalettes, palettesPng, gbaTilesPng, gbTilesPng } from './video.mjs';
+import { screenText, learnCharmap, normalizeCharmap } from './screentext.mjs';
+import { romHeaderIssues, RunChecker } from './checks.mjs';
+import { runCommand, parseDiagnostics, formatDiagnostic, detectBuild, findRom, readProjectConfig } from './build.mjs';
+import { convertBackground, writeBackgroundSource, renderTiledMap, BG_TARGETS } from './background.mjs';
+import { TEMPLATES, createProject } from './templates.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = path.join(__dirname, 'out');
@@ -42,17 +50,18 @@ const VERSION = JSON.parse(readFileSync(path.join(__dirname, 'package.json'), 'u
 
 const BUTTONS = ['A', 'B', 'L', 'R', 'START', 'SELECT', 'UP', 'DOWN', 'LEFT', 'RIGHT'];
 const Button = z.enum(BUTTONS);
-const Address = z.union([z.number().int().nonnegative(), z.string()]).describe('number or hex string "0x0300..."');
+const Address = z.union([z.number().int().nonnegative(), z.string()]).describe('number, "0x..." or symbol');
 const Scale = z.number().int().min(1).max(4).default(2);
 
 /** Tools in the "core" set: enough to play, look, check and script a game. */
 export const CORE_TOOLS = ['load_rom', 'wait_frames', 'press', 'set_button', 'wait_until', 'screenshot',
-  'read_memory', 'write_memory', 'run_sequence', 'assert_golden', 'status'];
+  'read_memory', 'write_memory', 'run_sequence', 'assert_golden', 'status', 'build', 'describe'];
 
 /** Drop JSON-schema detail that costs tokens on every request but rarely helps
- *  a model: the $schema URL, numeric bounds, and "type" next to an enum. Inputs
- *  are still fully validated by the zod schemas on the server, whose error
- *  messages state the limits. */
+ *  a model: the $schema URL, numeric bounds, "type" next to an enum, a record's
+ *  default key/value schemas; and write anyOf of plain types as a type list.
+ *  Inputs are still fully validated by the zod schemas on the server, whose
+ *  error messages state the limits. */
 function slimSchema(node) {
   if (Array.isArray(node)) return node.map(slimSchema);
   if (!node || typeof node !== 'object') return node;
@@ -60,6 +69,9 @@ function slimSchema(node) {
   for (const [k, v] of Object.entries(node)) {
     if (k === '$schema' || k === 'minimum' || k === 'maximum' || k === 'exclusiveMinimum' || k === 'exclusiveMaximum') continue;
     if (k === 'type' && node.enum) continue;
+    if (k === 'propertyNames' && v?.type === 'string' && Object.keys(v).length === 1) continue;
+    if (k === 'additionalProperties' && v && typeof v === 'object' && !Object.keys(v).length) continue;
+    if (k === 'anyOf' && v.every((x) => Object.keys(x).length === 1 && typeof x.type === 'string')) { out.type = v.map((x) => x.type); continue; }
     out[k] = slimSchema(v);
   }
   return out;
@@ -92,6 +104,11 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
   let search = null;        // active RamSearch
   let rec = [];             // steps done since load_rom (export_script)
   const record = (step) => { rec.push(step); };
+  let cfg = {};             // gbtest.json of the workspace
+  let lastFast = fast;      // load_rom's fast setting, reused by build
+  let watches = null;       // [{ label, expr, as }] (null = from gbtest.json)
+  let charmap = null;       // describe's charmap (null = from gbtest.json)
+  let lastDescribe = null;  // screenshot at the last describe
 
   const server = new McpServer({ name: 'gb-gbc-gba-test-mcp', version: VERSION });
 
@@ -141,6 +158,35 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
   function requireRom() {
     if (!emu) throw new Error('No ROM loaded. Call load_rom first.');
   }
+  /** "0xc0a0" or "0xc0a0 (wPlayerX)". */
+  const label = (addr) => { const n = emu?.symbols?.nameOf(addr, { maxOffset: 32 }); return n ? `${hex(addr)} (${n})` : hex(addr); };
+
+  /** @param {string} abs @param {{ fast?: boolean, symbols?: string }} [opts] */
+  async function loadRom(abs, { fast: ff = lastFast, symbols = undefined } = {}) {
+    if (emu) { await emu.close().catch(() => {}); emu = null; }
+    states.clear(); search = null; rec = []; lastDescribe = null;
+    const bd = await baseDir();
+    cfg = await readProjectConfig(bd);
+    const sym = symbols ?? (cfg.symbols ? path.resolve(bd, cfg.symbols) : true);
+    emu = await EmuHarness.launch(abs, { reuse: true, fast: ff, symbols: sym });
+    lastFast = ff;
+    romName = path.basename(abs); romPath = abs;
+    return emu;
+  }
+  const symbolInfo = () => (emu.symbols ? `, ${emu.symbols.count} symbols from ${path.basename(emu.symbols.file)}` : emu.symbolsError ? `; symbols not loaded: ${emu.symbolsError}` : '');
+
+  /** Watched variables: "name", "name:u16", "0xC000:s8". */
+  const parseWatch = (w) => { const m = /^(.*?)(?::(u8|u16|u32|s8|s16|s32))?$/.exec(String(w).trim()); return { label: m[1], expr: m[1], as: m[2] ?? 'u8' }; };
+  const activeWatches = () => watches ?? (Array.isArray(cfg.watch) ? cfg.watch.map(parseWatch) : []);
+  async function watchValues() {
+    const out = [];
+    for (const w of activeWatches()) {
+      try { out.push(`${w.label}=${decodeValues(await emu.readMemory(emu.addr(w.expr), VALUE_TYPES[w.as][0]), w.as)[0]}`); } catch { out.push(`${w.label}=?`); }
+    }
+    return out;
+  }
+  /** A "watch: a=1 b=2" line to append to results that advance time ('' if none). */
+  const watchLine = async () => { const v = emu ? await watchValues() : []; return v.length ? `\nwatch: ${v.join(' ')}` : ''; };
   // Results carry their data ONCE: lists and dumps go in the text (what the model
   // reads); structuredContent holds only small scalar fields for programmatic use.
   const result = (text, structured, extra = []) => ({
@@ -175,20 +221,21 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
 
   // ---- Play ----
   tool('load_rom', {
-    description: 'Boot a .gba/.gb/.gbc ROM (or a .zip holding one). Starts fresh: states, cheats, RAM search and recording are cleared. The emulator is paused between calls, so reads are frame-exact.',
+    description: 'Boot a .gba/.gb/.gbc (or .zip) ROM, fresh. A symbol file beside it (.sym/.noi/.elf/.map) lets addresses be names. Paused between calls: reads are frame-exact.',
     inputSchema: {
-      rom: z.string(),
-      fast: z.boolean().default(fast).describe('Fast-forward long waits (results identical)'),
+      rom: z.string().optional().describe('default: gbtest.json rom'),
+      fast: z.boolean().default(fast).describe('fast-forward long waits (same results)'),
+      symbols: z.string().optional().describe('symbol file if not beside the ROM'),
     },
-  }, async ({ rom, fast: ff }) => {
-    if (emu) { await emu.close().catch(() => {}); emu = null; }
-    states.clear(); search = null; rec = [];
-    const abs = await resolvePath(rom);
-    emu = await EmuHarness.launch(abs, { reuse: true, fast: ff });
-    romName = path.basename(abs); romPath = abs;
+  }, async ({ rom, fast: ff, symbols }) => {
+    const bd = await baseDir();
+    const want = rom ?? (await readProjectConfig(bd)).rom;
+    if (!want) return errText('give `rom` (or set "rom" in gbtest.json)');
+    const abs = await resolvePath(want);
+    await loadRom(abs, { fast: ff, symbols: symbols ? await resolvePath(symbols) : undefined });
     const dims = await emu.videoDimensions();
     const frame = await emu.frameNum();
-    return result(`Loaded ${abs} as ${sysName(emu.system)} ${dims.w}x${dims.h}, frame ${frame}.`,
+    return result(`Loaded ${abs} as ${sysName(emu.system)} ${dims.w}x${dims.h}, frame ${frame}${symbolInfo()}.`,
       { system: sysName(emu.system), frame });
   }, { needsRom: false });
 
@@ -199,7 +246,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     await emu.waitFrames(frames);
     record({ wait: frames });
     const frame = await emu.frameNum();
-    return result(`Frame ${frame}.`, { frame });
+    return result(`Frame ${frame}.${await watchLine()}`, { frame });
   });
 
   tool('press', {
@@ -215,7 +262,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     await emu.tap(list, args.hold, args.release);
     record({ tap: list.length === 1 ? list[0] : list, hold: args.hold, release: args.release });
     const frame = await emu.frameNum();
-    return result(`Pressed ${list.join('+')}. Frame ${frame}.`, { frame });
+    return result(`Pressed ${list.join('+')}. Frame ${frame}.${await watchLine()}`, { frame });
   });
 
   tool('set_button', {
@@ -246,12 +293,12 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
   }, async ({ address, as, op, value, screen, frames, maxFrames, precise, screenshot, scale }) => {
     let cond;
     if (screen) cond = { screen, frames };
-    else if (address !== undefined) cond = { address: parseAddress(address), as, op, value };
+    else if (address !== undefined) cond = { address: emu.addr(address), as, op, value };
     else return errText('give `address` (+ op/value) or `screen`');
     const before = await emu.waitTarget(), f0 = await emu.frameNum();
     const r = await emu.waitFor(cond, { maxFrames, precise });
     record({ wait: r.frame - before });
-    const text = r.met ? `Met at frame ${r.frame} (+${r.frame - f0}).` : `Not met within ${maxFrames} frames; frame ${r.frame}.`;
+    const text = (r.met ? `Met at frame ${r.frame} (+${r.frame - f0}).` : `Not met within ${maxFrames} frames; frame ${r.frame}.`) + await watchLine();
     const extra = screenshot ? [png(scalePng(await emu.screenshot(), scale))] : [];
     return result(text, { met: r.met, frame: r.frame, waited: r.frame - f0 }, extra);
   });
@@ -262,7 +309,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
   }, async () => {
     await emu.restart();
     record({ reset: true });
-    return result(`Reset. Frame ${await emu.frameNum()}.`);
+    return result(`Reset. Frame ${await emu.frameNum()}.${await watchLine()}`);
   });
 
   // ---- Look ----
@@ -286,23 +333,24 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
   });
 
   tool('read_memory', {
-    description: 'Read RAM. GBA: 0x02000000 EWRAM, 0x03000000 IWRAM, 0x04000000 IO. GB: 0xC000 WRAM, 0xFF80 HRAM, 0xFE00 OAM, 0xFF00 IO, 0xA000 cart RAM. A typed `as` decodes every value.',
+    description: 'Read RAM. GBA: 0x02000000 EWRAM, 0x03000000 IWRAM, 0x04000000 IO. GB: 0xC000 WRAM, 0xFF80 HRAM, 0xFE00 OAM, 0xFF00 IO, 0xA000 cart RAM.',
     inputSchema: {
       address: Address,
-      length: z.number().int().positive().max(4096).default(4).describe('bytes'),
+      length: z.number().int().positive().max(4096).optional().describe('bytes (default 4, or 1 value with as)'),
       as: z.enum(['hex', ...Object.keys(VALUE_TYPES)]).default('hex'),
     },
     annotations: RO,
   }, async ({ address, length, as }) => {
-    const addr = parseAddress(address);
-    if (as === 'hex') return result(`${hex(addr)}: ${hexBytes(await emu.readMemory(addr, length))}`);
+    const addr = emu.addr(address);
+    if (as === 'hex') return result(`${label(addr)}: ${hexBytes(await emu.readMemory(addr, length ?? 4))}`);
     const w = VALUE_TYPES[as][0];
+    length ??= w;
     const values = decodeValues(await emu.readMemory(addr, Math.max(length - (length % w), w)), as);
-    return result(`${hex(addr)} ${as}: ${values.length === 1 ? `${values[0]} (${hex(values[0])})` : values.join(', ')}`, { values });
+    return result(`${label(addr)} ${as}: ${values.length === 1 ? `${values[0]} (${hex(values[0])})` : values.join(', ')}`, { values });
   });
 
   tool('read_cpu', {
-    description: 'CPU registers. A pc that stays put across waits means a hang.',
+    description: 'CPU registers (pc named from symbols). A pc that stays put across waits means a hang.',
     inputSchema: {},
     annotations: RO,
   }, async () => {
@@ -313,7 +361,8 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
       ? `pc=${h4(c.pc)} exec=${h4(c.executing)} ${c.thumb ? 'thumb' : 'arm'} ${c.mode} sp=${h4(c.sp)} lr=${h4(c.lr)} cpsr=${h4(c.cpsr)} ${fl(['n', 'z', 'c', 'v'])}${c.irqDisabled ? ' irq-off' : ''}\n` +
         c.r.map((v, i) => `r${i}=${h4(v)}`).join(' ')
       : `pc=${h2(c.pc)} sp=${h2(c.sp)} af=${h1(c.a)}${h1(c.f)} bc=${h1(c.b)}${h1(c.c)} de=${h1(c.d)}${h1(c.e)} hl=${h1(c.h)}${h1(c.l)} ${fl(['z', 'n', 'h', 'c'])} ime=${c.ime ? 1 : 0}${c.halted ? ' halted' : ''}`;
-    return result(`Frame ${await emu.frameNum()}: ${text}`, { pc: c.pc });
+    const at = emu.symbols?.nameOf(emu.system === 'gba' ? c.executing ?? c.pc : c.pc, { bank: c.romBank });
+    return result(`Frame ${await emu.frameNum()}: ${text}${at ? `\nin ${at}` : ''}`, { pc: c.pc });
   });
 
   tool('read_sprites', {
@@ -379,7 +428,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
       hex: z.string().optional().describe('raw bytes, e.g. "deadbeef"'),
     },
   }, async ({ address, value, as, hex: hx }) => {
-    const addr = parseAddress(address);
+    const addr = emu.addr(address);
     let bytes;
     if (hx != null) {
       const clean = hx.replace(/[^0-9a-fA-F]/g, '');
@@ -392,8 +441,8 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     }
     const stuck = await emu.writeMemory(addr, bytes);
     record({ write: hex(addr), hex: bytes.toString('hex') });
-    if (stuck) return result(`Wrote ${bytes.length}B at ${hex(addr)}.`, { stuck });
-    return result(`Wrote ${bytes.length}B at ${hex(addr)} but it did not stick (not RAM, or overwritten); now: ${hexBytes(await emu.readMemory(addr, bytes.length))}.`, { stuck });
+    if (stuck) return result(`Wrote ${bytes.length}B at ${label(addr)}.`, { stuck });
+    return result(`Wrote ${bytes.length}B at ${label(addr)} but it did not stick (not RAM, or overwritten); now: ${hexBytes(await emu.readMemory(addr, bytes.length))}.`, { stuck });
   });
 
   tool('save_state', {
@@ -426,7 +475,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     await emu.loadState(st);
     record(p ? { loadStateFile: await resolvePath(p) } : { loadState: id });
     const frame = await emu.frameNum();
-    return result(`Restored. Frame ${frame}.`, { frame });
+    return result(`Restored. Frame ${frame}.${await watchLine()}`, { frame });
   });
 
   tool('set_cheats', {
@@ -439,7 +488,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
   });
 
   tool('battery_save', {
-    description: 'Battery save (.sav): action "export" writes it to `path`; "import" loads `path` and resets so the game boots with it (reset:false to skip).',
+    description: 'Battery save (.sav): export to `path`, or import from it and reset so the game boots with it.',
     inputSchema: { action: z.enum(['export', 'import']), path: z.string(), reset: z.boolean().default(true) },
   }, async ({ action, path: p, reset }) => {
     if (action === 'export') {
@@ -460,7 +509,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
 
   // ---- Test ----
   tool('run_sequence', {
-    description: 'Run many steps in one call (cheaper than separate calls). Steps, one key each: wait:N | tap:btn or [btns] (hold,release) | press/release:btn | hold:btn,frames | waitUntil:{address,op,value} or {screen:changed|stable} (maxFrames) | shot:name | record:{frames,every} | saveState/loadState:id | loadStateFile:path | read:addr (as) | write:addr,value|hex | assertRam:addr,equals|min|max | assert:png (threshold,ignore,sprite) | video:{frames,path} | reset:true | cheats:[..] | importSave:path',
+    description: 'Run many steps in one call. Steps, one key each: wait:N | tap:btn or [btns] (hold,release) | press/release:btn | hold:btn,frames | waitUntil:{address,op,value} or {screen:changed|stable} (maxFrames) | shot:name | record:{frames,every} | saveState/loadState:id | loadStateFile:path | read:addr (as) | write:addr,value|hex | assertRam:addr,equals|min|max | assert:png (threshold,ignore,sprite) | video:{frames,path} | reset:true | cheats:[..] | importSave:path',
     inputSchema: {
       steps: z.array(z.record(z.string(), z.any())).min(1),
       scale: Scale,
@@ -509,13 +558,13 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     const summary = `${res.failures ? `FAIL (${res.failures})` : 'OK'}: ${steps.length} steps, frame ${frame}.` +
       (dropped ? ` ${dropped} image(s) not shown${out ? `; saved in ${out}` : ''}.` : '') +
       (res.video ? ` Video: ${res.video}.` : '') +
-      (lines.length ? `\n${lines.join('\n')}` : '');
+      (lines.length ? `\n${lines.join('\n')}` : '') + await watchLine();
     const r = result(summary, { pass: res.failures === 0, failures: res.failures, frame }, images);
     return res.failures ? { ...r, isError: true } : r;
   });
 
   tool('record_video', {
-    description: 'Play `frames` frames into a video for people: .gif .png(animated) .webm .mp4 (with sound if ffmpeg allows) or .wav.',
+    description: 'Play `frames` frames into a video: .gif .png(animated) .webm .mp4 (with sound if ffmpeg allows) .wav.',
     inputSchema: {
       frames: z.number().int().positive().max(36000),
       path: z.string(),
@@ -559,7 +608,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
   });
 
   tool('export_script', {
-    description: 'Everything done since load_rom as replayable run_sequence steps (JSON). Add assert steps to make it a regression test.',
+    description: 'Everything done since load_rom as replayable run_sequence steps; add asserts for a regression test.',
     inputSchema: {
       path: z.string().optional(),
       includeShots: z.boolean().default(false).describe('keep a step per screenshot'),
@@ -585,7 +634,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
   });
 
   tool('ab_compare', {
-    description: 'Run the same steps on two ROMs side by side; reports which shot/read steps differ, with A|B|diff images. Leaves the loaded ROM alone.',
+    description: 'Run the same steps on two ROMs; reports which shot/read steps differ, with A|B|diff images.',
     inputSchema: {
       romA: z.string(), romB: z.string(),
       steps: z.array(z.record(z.string(), z.any())).min(1),
@@ -656,7 +705,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
       } else head = 'Candidates:';
     }
     const rows = search.results(limit);
-    const lines = rows.map((r) => `${hex(r.address)}${r.bank !== undefined ? `/b${r.bank}` : ''} ${r.region} =${r.value}${r.previous !== undefined ? ` (was ${r.previous})` : ''}`);
+    const lines = rows.map((r) => `${label(r.address)}${r.bank !== undefined ? `/b${r.bank}` : ''} ${r.region} =${r.value}${r.previous !== undefined ? ` (was ${r.previous})` : ''}`);
     const more = search.count > rows.length ? `\n…${search.count - rows.length} more` : '';
     return result(`${head} ${search.count} (${search.type}).${lines.length ? `\n${lines.join('\n')}${more}` : ''}`, { count: search.count });
   });
@@ -717,9 +766,175 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     return result(`${head} ${info}${r.notes.length ? ' ' + r.notes.join('; ') : ''}`, { tile: r.tile, kept }, [png(scalePng(await emu.screenshot(), a.scale))]);
   }, { needsRom: false });
 
+  // ---- Make: backgrounds ----
+  tool('background', {
+    description: 'PNG or Tiled .tmx/.tmj map → deduped tiles + tilemap + palettes; out=.c/.h/.s/.asm/.bin; returns a preview rebuilt from them. Fonts: dedupe false.',
+    inputSchema: {
+      png: z.string().optional(), tiled: z.string().optional(),
+      target: z.enum(Object.keys(BG_TARGETS)).optional().describe('default: the loaded ROM\'s'),
+      dedupe: z.boolean().default(true),
+      flips: z.boolean().optional(),
+      transparent: z.string().optional().describe('GBA backdrop: alpha|#rrggbb'),
+      out: z.string().optional(),
+      scale: Scale,
+    },
+  }, async (a) => {
+    if (!a.png === !a.tiled) return errText('give `png` or `tiled`');
+    const target = a.target ?? (emu ? (emu.system === 'gba' ? 'gba4' : ((await emu.readRegions()).isCgbWram ? 'gbc' : 'gb')) : null);
+    if (!target) return errText('give `target` (no ROM loaded)');
+    const src = await resolvePath(a.png ?? a.tiled);
+    const img = a.tiled ? await renderTiledMap(src) : await readFile(src);
+    const conv = convertBackground(img, { target, dedupe: a.dedupe, flips: a.flips, transparent: a.transparent });
+    const files = a.out ? await writeBackgroundSource(conv, await writePath(a.out), path.basename(a.out).replace(/\.[^.]+$/, '')) : [];
+    const sc = Math.max(1, Math.min(a.scale, Math.floor(1600 / (conv.cols * 8))));
+    const text = `${conv.cols}x${conv.rows} map, ${conv.tileCount} unique tiles of ${conv.cells}${conv.flipped ? ` (${conv.flipped} reused mirrored)` : ''}, ${conv.palettes.length || 1} palette(s), ${target}.` +
+      (conv.warnings.length ? ` WARN: ${conv.warnings.join('; ')}.` : '') + (files.length ? ` Wrote ${files.join(', ')}.` : '');
+    return result(text, { tiles: conv.tileCount, palettes: conv.palettes.length }, [png(scalePng(conv.previewPng, sc))]);
+  }, { needsRom: false });
+
+  // ---- Develop ----
+  tool('build', {
+    description: 'Build (gbtest.json build, else make): errors as file:line, then load the ROM + symbols and check its header. replay: redo the steps since the last load.',
+    inputSchema: {
+      command: z.string().optional(),
+      rom: z.string().optional().describe('default: gbtest.json rom, else the newest'),
+      load: z.boolean().default(true),
+      replay: z.boolean().default(false),
+    },
+  }, async ({ command, rom, load, replay }) => {
+    const bd = await baseDir();
+    cfg = await readProjectConfig(bd);
+    const cmd = command ?? cfg.build ?? await detectBuild(bd);
+    if (!cmd) return errText(`no build command: pass \`command\` or add {"build": "..."} to ${path.join(bd, 'gbtest.json')}`);
+    const r = await runCommand(cmd, bd);
+    const diags = parseDiagnostics(r.output);
+    const errors = diags.filter((d) => d.level === 'error'), warns = diags.filter((d) => d.level === 'warning');
+    const secs = (r.ms / 1000).toFixed(1);
+    const count = `${errors.length} error(s), ${warns.length} warning(s)`;
+    if (r.code !== 0 || r.timedOut) {
+      const shown = (errors.length ? errors : diags).slice(0, 25).map(formatDiagnostic);
+      const tail = shown.length ? '' : `\n${r.output.trim().split(/\r?\n/).slice(-25).join('\n')}`;
+      return errText(`Build FAILED (${r.timedOut ? 'timed out' : `exit ${r.code}`}, ${secs}s): ${count}.\n${shown.join('\n')}${tail}`);
+    }
+    let text = `Built with \`${cmd}\` in ${secs}s${warns.length ? `, ${warns.length} warning(s):\n${warns.slice(0, 10).map(formatDiagnostic).join('\n')}` : '.'}`;
+    if (!load) return result(text, { built: true });
+    const want = rom ?? cfg.rom;
+    const abs = want ? await resolvePath(want) : await findRom(bd);
+    if (!abs) return result(`${text}\nNo ROM found to load; pass \`rom\`.`, { built: true });
+    const steps = replay ? rec.filter((st) => !('shot' in st) && !('assert' in st) && !('video' in st) && !('record' in st)) : null;
+    await loadRom(abs);
+    text += `\nLoaded ${path.relative(bd, abs) || abs} (${sysName(emu.system)}${symbolInfo()}).`;
+    if (!/\.zip$/i.test(abs)) {
+      const issues = romHeaderIssues(await readFile(abs), emu.system).filter((f) => f.level !== 'ok');
+      if (issues.length) text += `\nROM header: ${issues.map((f) => `${f.level.toUpperCase()} ${f.msg}`).join('; ')}`;
+    }
+    if (steps?.length) {
+      const res = await runSteps(emu, steps, { baseDir: bd, states, checkWrite: await writeGuard(), onStep: record });
+      text += `\nReplayed ${steps.length} steps${res.failures ? ` (${res.failures} check(s) failed)` : ''}.`;
+    }
+    return result(`${text}\nFrame ${await emu.frameNum()}.${await watchLine()}`, { built: true, frame: await emu.frameNum() });
+  }, { needsRom: false });
+
+  tool('new_project', {
+    description: 'New game from a working template: text, a moving player, a passing test, gbtest.json, CI, dev container.',
+    inputSchema: { template: z.enum(Object.keys(TEMPLATES)), path: z.string() },
+  }, async ({ template, path: p }) => {
+    const dest = await writePath(p);
+    const files = await createProject(template, dest);
+    return result(`Created ${dest} (${files.length} files): ${files.join(', ')}. Set the workspace to it (or GBTEST_ROOT), then build.`);
+  }, { needsRom: false });
+
+  tool('watch', {
+    description: 'Variables reported after each step that advances time: "name", "name:u16", "0xC000:s8". Replaces the list.',
+    inputSchema: { vars: z.array(z.string()) },
+  }, async ({ vars }) => {
+    watches = vars.map(parseWatch);
+    const v = await watchValues();
+    return result(v.length ? `watch: ${v.join(' ')}` : 'Watch list cleared.');
+  });
+
+  tool('describe', {
+    description: 'Screen as text, far cheaper than a screenshot: on-screen text, sprites, watch values, % changed since last time.',
+    inputSchema: {
+      charmap: z.any().optional().describe('"ascii" or {first: tile of chars[0], chars}'),
+      learn: z.string().optional().describe('text you can see; infers the charmap'),
+      image: z.boolean().default(false),
+      scale: Scale,
+    },
+    annotations: RO,
+  }, async (a) => {
+    const r = await emu.readRegions();
+    const cpu = await emu.readCpu();
+    const lines = [];
+    const pc = emu.system === 'gba' ? cpu.executing ?? cpu.pc : cpu.pc;
+    const at = emu.symbols?.nameOf(pc, { bank: cpu.romBank });
+    lines.push(`Frame ${await emu.frameNum()}, ${emu.system === 'gba' ? 'GBA' : r.isCgbWram ? 'GBC' : 'GB'}, pc ${hex(pc)}${at ? ` (${at})` : ''}.`);
+    const wv = await watchValues();
+    if (wv.length) lines.push(`watch: ${wv.join(' ')}`);
+    if (a.charmap) charmap = normalizeCharmap(a.charmap);
+    if (a.learn) {
+      const cm = learnCharmap(emu.system, r, a.learn);
+      if (cm) { charmap = cm; lines.push(`charmap learned: first tile ${cm.first} (ASCII order).`); }
+      else lines.push(`"${a.learn}" not found on screen in ASCII tile order; give charmap {first, chars} instead.`);
+    }
+    const cm = charmap ?? (cfg.charmap ? normalizeCharmap(cfg.charmap) : null);
+    if (cm) {
+      const layers = screenText(emu.system, r, cm);
+      if (!layers.length) lines.push('text: none');
+      for (const l of layers) lines.push(`text (${l.name}):`, ...l.lines.map((t) => `  ${t}`));
+    } else lines.push('text: unknown font; pass charmap ("ascii" or {first, chars}) or learn: "<text you can see>".');
+    const list = (emu.system === 'gba' ? gbaSprites(r) : gbSprites(r, { cgb: !!r.isCgbWram })).filter((s) => s.onScreen);
+    const sp = list.slice(0, 16).map((s) => `#${s.index} ${s.x},${s.y} ${s.w}x${s.h} t${s.tile}`);
+    lines.push(`sprites: ${list.length ? sp.join(' · ') + (list.length > 16 ? ` · +${list.length - 16} more` : '') : 'none'}`);
+    const shot = await emu.screenshot();
+    if (lastDescribe) {
+      const c = compare(lastDescribe, shot, { tolerance: 0 });
+      lines.push(`screen: ${c.fraction === 0 ? 'unchanged' : `${(c.fraction * 100).toFixed(1)}% changed`} since the last describe`);
+    }
+    lastDescribe = shot;
+    return result(lines.join('\n'), undefined, a.image ? [png(scalePng(shot, a.scale))] : []);
+  });
+
+  tool('check', {
+    description: 'Hardware rules: ROM header, then `frames` frames watching for crashes, bad stack, sprite overflow, bitmap-mode sprite tiles, blank screen, lag. State restored after.',
+    inputSchema: {
+      frames: z.number().int().min(1).max(3600).default(120),
+      frameCounter: Address.optional().describe('per-frame counter (default gbtest.json or *frame_count*)'),
+    },
+    annotations: RO,
+  }, async ({ frames, frameCounter }) => {
+    const found = [];
+    if (!/\.zip$/i.test(romPath)) found.push(...romHeaderIssues(await readFile(romPath), emu.system));
+    let counter = frameCounter ?? cfg.frameCounter ?? null, width = emu.system === 'gba' ? 4 : 1;
+    if (counter === null && emu.symbols) {
+      const s = [...emu.symbols.byName.values()].find((x) => /^_?(w|g_|s_)?frame_?(count|counter|cnt|num)s?$/i.test(x.name));
+      if (s) counter = s.name;
+    }
+    let counterAddr = null, counterNote = '';
+    if (counter !== null) {
+      try {
+        counterAddr = emu.addr(counter);
+        const sym = typeof counter === 'string' ? emu.symbols?.get(counter) : null;
+        if (sym?.size) width = Math.min(sym.size, 4) === 3 ? 2 : Math.min(sym.size, 4);
+      } catch (e) { counterNote = ` (frame counter: ${e.message})`; }
+    }
+    const checker = new RunChecker(emu.system, { frameCounter: counterAddr, counterWidth: width });
+    const saved = await emu.saveState(), f0 = await emu.frameNum();
+    try {
+      for (let i = 0; i < frames; i++) {
+        await emu.waitFrames(1);
+        checker.observe(await emu.readRegions(), await emu.readCpu(), counterAddr !== null ? await emu.readMemory(counterAddr, width) : null);
+      }
+    } finally { await emu.loadState(saved, { frame: f0 }); }
+    found.push(...checker.findings());
+    const errs = found.filter((f) => f.level === 'error').length, warns = found.filter((f) => f.level === 'warn').length;
+    const head = `${errs ? `${errs} error(s)` : 'No errors'}, ${warns} warning(s) over ${frames} frames${counterAddr === null ? counterNote || ' (no frame counter: lag not checked)' : ` (frame counter ${label(counterAddr)})`}; state restored.`;
+    return result([head, ...found.map((f) => `${f.level === 'ok' ? 'ok' : f.level.toUpperCase()}: ${f.msg}`)].join('\n'), { errors: errs, warnings: warns });
+  });
+
   // ---- Status ----
   const statusData = async () => (emu
-    ? { loaded: true, rom: romPath, system: sysName(emu.system), frame: await emu.frameNum(), held: await emu.heldButtons(), states: [...states.keys()], cheats: emu.cheats.length, ramSearch: search ? search.count : null, recordedSteps: rec.length }
+    ? { loaded: true, rom: romPath, system: sysName(emu.system), frame: await emu.frameNum(), held: await emu.heldButtons(), states: [...states.keys()], cheats: emu.cheats.length, ramSearch: search ? search.count : null, recordedSteps: rec.length, symbols: emu.symbols ? `${emu.symbols.file} (${emu.symbols.count})` : null, watch: activeWatches().map((w) => w.label) }
     : { loaded: false });
 
   tool('status', {
@@ -855,4 +1070,13 @@ export async function main() {
   console.error(`gb-gbc-gba-test-mcp ${VERSION} ready (stdio).`);
 }
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
-if (isMain) await main();
+if (isMain && process.argv[2] === 'new') {
+  // gb-gbc-gba-test-mcp new <template> <dir>
+  const [, , , template, dir] = process.argv;
+  if (!template || !dir) {
+    console.error(`usage: gb-gbc-gba-test-mcp new <template> <dir>\ntemplates: ${Object.entries(TEMPLATES).map(([k, v]) => `\n  ${k.padEnd(7)} ${v}`).join('')}`);
+    process.exit(1);
+  }
+  const files = await createProject(template, path.resolve(dir));
+  console.log(`Created ${dir} (${files.length} files). cd ${dir} && make`);
+} else if (isMain) await main();

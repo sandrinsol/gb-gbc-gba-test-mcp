@@ -1,0 +1,7 @@
+{
+  "build": "make",
+  "rom": "build/hello.gb",
+  "charmap": "ascii",
+  "watch": ["wPlayerX", "wPlayerY"],
+  "frameCounter": "wFrameCounter"
+}

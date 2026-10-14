@@ -1,0 +1,48 @@
+# Builds the ROM and runs every tests/gb/*.json script against it in the
+# gb-gbc-gba-test emulator. Failures upload the screenshots and diffs.
+name: gb-tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the ARM toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi binutils-arm-none-eabi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build
+        run: make
+
+      - name: Fetch the test harness
+        run: |
+          git clone --depth 1 https://github.com/sandrinsol/gb-gbc-gba-test-mcp "$RUNNER_TEMP/gbtest"
+          cd "$RUNNER_TEMP/gbtest/harness"
+          npm ci --ignore-scripts
+          npx playwright install --with-deps chromium
+
+      - name: Run the tests
+        run: |
+          status=0
+          for script in tests/gb/*.json; do
+            echo "::group::$script"
+            node "$RUNNER_TEMP/gbtest/harness/runner.mjs" "$script" "out/$(basename "$script" .json)" || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: gb-test-results
+          path: |
+            out/
+            tests/gb/goldens/*.diff.png

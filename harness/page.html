@@ -342,12 +342,12 @@
       return u8ToB64(u8);
     };
     // The logical clock keeps counting from where it is (a state doesn't carry the
-    // frontend's frame counter); re-anchor the deterministic target so later
-    // waitFrames() calls stay correct.
-    Emu.loadState = async (b64) => {
+    // frontend's frame counter) unless `frame` says what to set it to; re-anchor
+    // the deterministic target so later waitFrames() calls stay correct.
+    Emu.loadState = async (b64, frame) => {
       Emu.pause();
       const u8 = b64ToU8(b64);
-      await restore(u8, Emu.frameNum());
+      await restore(u8, frame ?? Emu.frameNum());
       Emu._target = Emu.frameNum();
       Emu._fbValid = false;
       Emu._screen = shotByState.get(hashState(u8)) || null;

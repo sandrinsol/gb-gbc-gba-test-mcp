@@ -127,6 +127,6 @@ export function cpu(state) {
   return {
     pc: n('pc'), sp: n('sp'), a: n('a'), f: F, b: n('b'), c: n('c'), d: n('d'), e: n('e'), h: n('h'), l: n('l'),
     flags: { z: !!(F & 0x80), n: !!(F & 0x40), h: !!(F & 0x20), c: !!(F & 0x10) },
-    ime: !!n('ime'), halted: !!n('halt'),
+    ime: !!n('ime'), halted: !!n('halt'), romBank: n('rombank'),
   };
 }

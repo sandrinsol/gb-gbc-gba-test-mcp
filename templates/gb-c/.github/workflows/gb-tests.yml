@@ -1,0 +1,48 @@
+# Builds the ROM and runs every tests/gb/*.json script against it in the
+# gb-gbc-gba-test emulator. Failures upload the screenshots and diffs.
+name: gb-tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GBDK-2020
+        run: curl -sSL https://github.com/gbdk-2020/gbdk-2020/releases/download/4.3.0/gbdk-linux64.tar.gz | tar -xz -C "$RUNNER_TEMP"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build
+        run: make GBDK="$RUNNER_TEMP/gbdk"
+
+      - name: Fetch the test harness
+        run: |
+          git clone --depth 1 https://github.com/sandrinsol/gb-gbc-gba-test-mcp "$RUNNER_TEMP/gbtest"
+          cd "$RUNNER_TEMP/gbtest/harness"
+          npm ci --ignore-scripts
+          npx playwright install --with-deps chromium
+
+      - name: Run the tests
+        run: |
+          status=0
+          for script in tests/gb/*.json; do
+            echo "::group::$script"
+            node "$RUNNER_TEMP/gbtest/harness/runner.mjs" "$script" "out/$(basename "$script" .json)" || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: gb-test-results
+          path: |
+            out/
+            tests/gb/goldens/*.diff.png

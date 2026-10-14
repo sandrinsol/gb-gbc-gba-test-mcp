@@ -7,8 +7,11 @@ downloaded at runtime.
 
 - `mcp-server.mjs` — MCP server for agents (Claude Code, Cursor, VS Code, …).
 - `driver.mjs` — the same features as a Node library, for scripts and CI.
-- A Claude Code plugin bundling the server with skills for testing, homebrew
-  development and CI ([`skills/`](../skills/)).
+- Starter games for RGBDS, GBDK-2020 and arm-none-eabi-gcc that build, run and pass
+  a test from the start ([`templates/`](../templates/)).
+- A Claude Code plugin bundling the server with skills (testing, homebrew
+  development, hardware reference, playtesting, CI) and a `gb-tester` agent
+  ([`skills/`](../skills/), [`agents/`](../agents/)).
 
 ## Setup
 
@@ -49,18 +52,21 @@ Add the server to your MCP host:
 
 | Variable | Effect |
 |----------|--------|
-| `GBTEST_ROOT` | Base for relative paths. Default: the host's workspace root, else the working directory. |
+| `GBTEST_ROOT` | Base for relative paths and `gbtest.json`. Default: the host's workspace root, else the working directory. |
 | `GBTEST_TOOLS` | Expose only some tools: `core`, or a comma list such as `core,ram_search`. |
 | `GBTEST_CHROMIUM` | Use this Chrome/Chromium binary instead of Playwright's. |
 | `GBTEST_FFMPEG` | ffmpeg for `.webm`/`.mp4` video (default: one on PATH, else Playwright's). |
 | `GBTEST_ALLOW_ANY_PATH=1` | Allow writing files outside the workspace (refused by default). |
 | `UPDATE_GOLDENS=1` | Re-create golden images instead of comparing. |
 
+Start a game from a template: `npx gb-gbc-gba-test-mcp new <gb-asm|gb-c|gba-c> <dir>`
+(or the `new_project` tool).
+
 ## Tools
 
 | Tool | Does |
 |------|------|
-| `load_rom` | Boot a `.gba`, `.gb`, `.gbc`, or a `.zip` containing one. |
+| `load_rom` | Boot a `.gba`, `.gb`, `.gbc`, or a `.zip` containing one, with its symbol file if there is one. |
 | `wait_frames` | Advance N frames (60 = 1 s). |
 | `press` | Tap a button or a combo (`buttons: ["A","B"]`). |
 | `set_button` | Hold or release buttons. |
@@ -83,15 +89,49 @@ Add the server to your MCP host:
 | `ab_compare` | Run the same steps on two ROMs and report differences. |
 | `ram_search` | Find where a value (HP, score…) is stored: `start`, then `filter` until one address is left. |
 | `sprite` | Sprite art: `convert` a PNG to tiles + palette (source for your toolchain), `inject` it into the running game, `overlay` it on the screen, `export` a sprite from VRAM. |
+| `background` | Background art, fonts or a Tiled map (`.tmx`/`.tmj`) to tiles + tilemap + palettes, with duplicate and mirrored tiles merged; returns a preview rebuilt from the output. |
+| `build` | Run the project's build, report compiler errors as `file:line: error: …`, load the new ROM with its symbols, check its header; `replay` returns to where you were. |
+| `describe` | The screen as text: on-screen text, sprites, watched variables, how much changed. |
+| `watch` | Variables to report after every step that advances time. |
+| `check` | Hardware rules: ROM header, then a short run watching for crashes, a bad stack, sprite overflow, bitmap-mode sprite tiles, a blank screen and lag frames. |
+| `new_project` | Copy a starter template. |
 
 Prompts: `smoke_test_rom`, `regression_check`, `find_ram_address`,
 `record_regression_test`. Resources: `emu://screen`, `emu://status`.
 
-**Token use.** Tool definitions are sent with every request: ~2,700 tokens for all
-tools, ~1,400 with `GBTEST_TOOLS=core` (`load_rom wait_frames press set_button
-wait_until screenshot read_memory write_memory run_sequence assert_golden status`).
-A 2× GBA screenshot is ~205 tokens. Prefer one `run_sequence` over many single calls,
-and `wait_until` over wait-and-check loops.
+**Token use.** Tool definitions are sent with every request: ~3,300 tokens for all
+tools, ~1,600 with `GBTEST_TOOLS=core` (`load_rom wait_frames press set_button
+wait_until screenshot read_memory write_memory run_sequence assert_golden status
+build describe`). A 2× GBA screenshot is ~205 tokens; `describe` is usually under
+100. Prefer one `run_sequence` over many single calls, and `wait_until` over
+wait-and-check loops.
+
+## Projects: symbols and gbtest.json
+
+A symbol file next to the ROM with the same name is loaded with it: RGBDS `.sym`
+(`rgblink -n`), GBDK `.noi` (`lcc -Wl-j`), an `.elf` (devkitARM, Butano, any
+arm-none-eabi build), or a GNU ld / RGBDS `.map`. Every address argument and step
+then also takes a name, `"player_x"` or `"wPlayerX+1"`, and `read_cpu` names the
+function the CPU is in.
+
+`gbtest.json` in the workspace sets project defaults:
+
+```json
+{
+  "build": "make",
+  "rom": "build/game.gb",
+  "symbols": "build/game.sym",
+  "charmap": "ascii",
+  "watch": ["player_x", "lives:u16"],
+  "frameCounter": "frame_count"
+}
+```
+
+`charmap` tells `describe` which tile is which character: `"ascii"` (tile number =
+character code) or `{"first": <tile of the first char>, "chars": "<chars in tile
+order>"}`; `describe` with `learn: "<text on screen>"` works it out for fonts in
+ASCII order. `frameCounter` is a variable the game loop increments once per frame;
+`check` counts the frames where it didn't (lag).
 
 ## Steps
 
@@ -106,7 +146,7 @@ Each step has one action key:
 | wait for a condition | `{"waitUntil": {"address": "0xC000", "op": "eq", "value": 3}, "maxFrames": 600}`, `{"waitUntil": {"screen": "stable", "frames": 30}}` |
 | screenshot | `{"shot": "title"}`, `{"record": {"frames": 120, "every": 20, "prefix": "walk"}}` |
 | state | `{"saveState": "cp"}`, `{"loadState": "cp"}`, `{"loadStateFile": "boss.state"}` |
-| RAM | `{"read": "0x03000010", "as": "u16"}`, `{"write": "0x03000010", "value": 1}`, `{"assertRam": "0x03000010", "as": "u16", "equals": 3}` (or `min`/`max`) |
+| RAM | `{"read": "0x03000010", "as": "u16"}`, `{"write": "0x03000010", "value": 1}`, `{"assertRam": "lives", "equals": 3}` (or `min`/`max`) |
 | golden image | `{"assert": "goldens/title.png", "threshold": 0.02, "ignore": [{"x": 200, "y": 0, "w": 40, "h": 16}]}`, `{"assert": "goldens/hero.png", "sprite": 0}` |
 | video | `{"video": {"frames": 120, "path": "clips/walk.gif"}}` |
 | other | `{"reset": true}`, `{"cheats": ["..."]}`, `{"importSave": "100pct.sav"}` |
@@ -137,22 +177,25 @@ await emu.close();
 
 | Method | Description |
 |--------|-------------|
-| `EmuHarness.launch(rom, {fast=true, reuse=false, timeout=60000})` | Boot a ROM. `reuse` shares one browser between harnesses; call `EmuHarness.shutdown()` at the end. |
+| `EmuHarness.launch(rom, {fast=true, reuse=false, timeout=60000, symbols=true})` | Boot a ROM. `reuse` shares one browser between harnesses; call `EmuHarness.shutdown()` at the end. `symbols`: a file, or true to look next to the ROM. |
 | `waitFrames(n)`, `waitUntilFrame(f)`, `frameNum()` | Advance and read the frame clock. |
 | `waitFor(cond, {maxFrames, precise})` | Run until `{address, as, op, value}` or `{screen: 'changed'\|'stable', frames}` holds → `{met, frame}`. |
 | `setButton(b, down)`, `setButtons(bs, down)`, `tap(b \| bs, hold, release)` | Input. Buttons: `A B L R START SELECT UP DOWN LEFT RIGHT`. |
 | `screenshot(path?)` | PNG `Buffer`. |
-| `readMemory(addr, len)`, `readU8/U16/U32(addr)`, `readRegions()` | RAM. |
+| `readMemory(addr, len)`, `readU8/U16/U32(addr)`, `readRegions()` | RAM; `addr` can be a symbol name. |
 | `writeMemory(addr, buf)`, `writeU8/U16/U32(addr, v)` | Write RAM; returns whether it stuck. |
-| `saveState()`, `loadState(buf)` | Full machine snapshots. |
+| `saveState()`, `loadState(buf, {frame})` | Full machine snapshots (`frame`: the frame number to continue from). |
+| `symbols`, `useSymbols(file)`, `addr(nameOrAddress)` | The loaded symbol table. |
 | `readCpu()`, `readSaveData()`, `writeSaveData(buf)`, `setCheats(codes)`, `restart()` | CPU, battery save, cheats, reset. |
 | `record(n, {every})`, `startRecording()`, `stopRecording()` | Frame-exact captures `[{frame, png}]` with `.audio` (PCM); save with `saveVideo()` from `recording.mjs`. |
 | `sprites()`, `spriteImage(i)` | Decoded sprite table; one sprite's graphics as PNG. |
 | `videoDimensions()`, `close()` | |
 
 Golden comparison (`assert.mjs`), RAM search (`ramsearch.mjs`), video encoding
-(`recording.mjs`) and sprite conversion (`sprite.mjs`: `convertSprite`,
-`writeSpriteSource`, `injectSprite`) can also be used on their own.
+(`recording.mjs`), sprite conversion (`sprite.mjs`), backgrounds and Tiled maps
+(`background.mjs`), symbols (`symbols.mjs`), screen text (`screentext.mjs`),
+hardware checks (`checks.mjs`) and build-output parsing (`build.mjs`) can also be
+used on their own.
 
 ## Behaviour
 
@@ -180,6 +223,9 @@ Golden comparison (`assert.mjs`), RAM search (`ramsearch.mjs`), video encoding
   when a full ffmpeg is installed (Playwright's has no audio encoders).
 - **Injected sprites** stay only if the game doesn't rewrite that sprite-table entry
   each frame; the tool says when it did. `overlay` previews without touching the game.
+- **Hardware checks** can't see VRAM/OAM writes made while the screen is drawing
+  (dropped on a console): that needs per-instruction hooks the cores don't expose.
+  Golden-image tests catch the glitches they cause.
 - **Golden images** depend on the software renderer; regenerate them with
   `UPDATE_GOLDENS=1` after a Chromium or Playwright upgrade.
 - **Files** are only written inside the workspace or `harness/out/`.

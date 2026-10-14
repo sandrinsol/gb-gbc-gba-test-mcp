@@ -1,0 +1,13 @@
+{
+  "rom": "build/hello.gb",
+  "steps": [
+    { "wait": 30 },
+    { "assert": "goldens/title.png" },
+    { "assertRam": "player_x", "as": "u8", "equals": 72 },
+    { "hold": "RIGHT", "frames": 20 },
+    { "assertRam": "player_x", "as": "u8", "min": 87, "max": 92 },
+    { "hold": "DOWN", "frames": 10 },
+    { "assertRam": "player_y", "as": "u8", "min": 69, "max": 74 },
+    { "assert": "goldens/moved.png" }
+  ]
+}

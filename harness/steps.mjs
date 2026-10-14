@@ -10,6 +10,7 @@
 //   { "record": { "frames": 120, "every": 20, "prefix": "walk" } }
 //   { "saveState": "cp" } / { "loadState": "cp" }   named, in-memory
 //   { "read": "0x03000010", "as": "u16", "name": "hp" }   record a RAM value
+//   (addresses can be symbol names when the ROM has a symbol file: "wPlayerX")
 //   { "write": "0x03000010", "value": 1, "as": "u8" }     set-up poke
 //   { "assertRam": "0x03000010", "as": "u16", "equals": 3, "name": "hp" }
 //   { "assert": "goldens/title.png", "threshold": 0.02, "name": "title",
@@ -31,21 +32,9 @@ import path from 'node:path';
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import { assertGolden } from './assert.mjs';
 import { saveVideo } from './recording.mjs';
+import { parseAddress } from './symbols.mjs';
 
-/** Parse a bus address given as a number or a string ("0x03000010", "$C000",
- *  "C000h", or decimal digits). JSON has no hex literals, so agents send strings. */
-export function parseAddress(a) {
-  if (typeof a === 'number') {
-    if (!Number.isInteger(a) || a < 0) throw new Error(`invalid address ${a}`);
-    return a;
-  }
-  const s = String(a).trim();
-  let m;
-  if ((m = /^(?:0x|\$)([0-9a-f]+)$/i.exec(s)) || (m = /^([0-9a-f]+)h$/i.exec(s))) return parseInt(m[1], 16);
-  if (/^\d+$/.test(s)) return parseInt(s, 10);
-  if (/^[0-9a-f]+$/i.test(s)) return parseInt(s, 16); // bare hex with a-f digits
-  throw new Error(`invalid address "${a}" (use e.g. "0x03000010" or a number)`);
-}
+export { parseAddress };
 
 export const VALUE_TYPES = { u8: [1, 'readUInt8'], u16: [2, 'readUInt16LE'], u32: [4, 'readUInt32LE'], s8: [1, 'readInt8'], s16: [2, 'readInt16LE'], s32: [4, 'readInt32LE'] };
 
@@ -184,21 +173,21 @@ async function runPlain(emu, steps, { outDir, baseDir = process.cwd(), states = 
       if (!st) throw new Error(`step ${i}: no saved state named "${step.loadState}"`);
       await emu.loadState(st);
     } else if ('read' in step) {
-      const addr = parseAddress(step.read), as = step.as ?? 'u8';
+      const addr = parseAddress(step.read, emu.symbols), as = step.as ?? 'u8';
       if (!VALUE_TYPES[as]) throw new Error(`step ${i}: bad "as" ${as}`);
       const count = step.count ?? 1;
       const vals = decodeValues(await emu.readMemory(addr, VALUE_TYPES[as][0] * count), as);
-      entry.action = `read ${step.name ?? hex(addr)}`;
+      entry.action = `read ${step.name ?? (emu.symbols?.get(String(step.read)) ? step.read : hex(addr))}`;
       entry.value = count === 1 ? vals[0] : vals;
     } else if ('write' in step) {
-      const addr = parseAddress(step.write);
+      const addr = parseAddress(step.write, emu.symbols);
       const bytes = step.hex != null ? Buffer.from(String(step.hex).replace(/[^0-9a-f]/gi, ''), 'hex') : encodeValue(step.value, step.as ?? 'u8');
       entry.action = `write ${hex(addr)}`;
       entry.stuck = await emu.writeMemory(addr, bytes);
     } else if ('assertRam' in step) {
-      const addr = parseAddress(step.assertRam), as = step.as ?? 'u8';
+      const addr = parseAddress(step.assertRam, emu.symbols), as = step.as ?? 'u8';
       const [val] = decodeValues(await emu.readMemory(addr, VALUE_TYPES[as][0]), as);
-      const name = step.name ?? hex(addr);
+      const name = step.name ?? (emu.symbols?.get(String(step.assertRam)) ? step.assertRam : hex(addr));
       const pass = 'equals' in step ? val === step.equals
         : ('min' in step || 'max' in step) ? val >= (step.min ?? -Infinity) && val <= (step.max ?? Infinity)
           : true;
@@ -207,7 +196,7 @@ async function runPlain(emu, steps, { outDir, baseDir = process.cwd(), states = 
       if (!pass) { failures++; log(`  ✗ assertRam ${name}: ${val}`); } else log(`  ✓ assertRam ${name} = ${val}`);
     } else if ('waitUntil' in step) {
       const c = { ...step.waitUntil };
-      if (c.address !== undefined) c.address = parseAddress(c.address);
+      if (c.address !== undefined) c.address = parseAddress(c.address, emu.symbols);
       const r = await emu.waitFor(c, { maxFrames: step.maxFrames ?? 600, precise: !!step.precise });
       entry.action = `waitUntil ${JSON.stringify(step.waitUntil)}`;
       entry.met = r.met; entry.metFrame = r.frame;
