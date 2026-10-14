@@ -24,11 +24,5 @@ build yourself are of course fine.
 
 ## What in this repo is original
 
-The test harness and MCP server (`harness/`) are original work, released under the
-same GPL-3.0-or-later as the repo:
-
-- `harness/mcp-server.mjs` — MCP server exposing the emulator as agent tools
-- `harness/driver.mjs` — headless Playwright driver
-- `harness/memory.mjs` — GBA RAM reads via mgba save-state parsing
-- `harness/assert.mjs`, `harness/png.mjs` — golden-frame diffing
-- `harness/runner.mjs` — JSON input-script → screenshot-timeline runner
+Everything in `harness/` (the test harness and MCP server), `index.html` and
+`start.command` is original work, released under the same GPL-3.0-or-later.
