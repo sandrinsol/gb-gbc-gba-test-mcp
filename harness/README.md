@@ -45,10 +45,8 @@ Add the server to your MCP host:
 }
 ```
 
-- VS Code uses the key `"servers"` instead of `"mcpServers"`; see
-  [`.vscode/mcp.json.example`](../.vscode/mcp.json.example).
-- Once the package is published to npm, `"command": "npx", "args": ["-y",
-  "gb-gbc-gba-test-mcp"]` works without a clone.
+VS Code uses the key `"servers"` instead of `"mcpServers"`; see
+[`.vscode/mcp.json.example`](../.vscode/mcp.json.example).
 
 | Variable | Effect |
 |----------|--------|
@@ -59,8 +57,8 @@ Add the server to your MCP host:
 | `GBTEST_ALLOW_ANY_PATH=1` | Allow writing files outside the workspace (refused by default). |
 | `UPDATE_GOLDENS=1` | Re-create golden images instead of comparing. |
 
-Start a game from a template: `npx gb-gbc-gba-test-mcp new <gb-asm|gb-c|gba-c> <dir>`
-(or the `new_project` tool).
+Start a game from a template with the `new_project` tool, or from the clone:
+`node harness/mcp-server.mjs new <gb-asm|gb-c|gba-c> <dir>`.
 
 ## Tools
 
@@ -248,6 +246,8 @@ npm run typecheck      # JSDoc types
 npm run package-test   # pack, install into an empty project, drive a ROM
 ```
 
-The npm package is the repo-root `package.json`; keep its `version` and
-`dependencies` in sync with this folder's (`package-test` checks). Publish with
-`npm publish` from the repo root.
+Releases: bump `version` in the repo-root `package.json`, this folder's
+`package.json` and `.claude-plugin/plugin.json` (`package-test` checks they match),
+optionally add `.github/release-notes/v<version>.md`, and merge to `main`: the
+`release` workflow tags it and publishes a GitHub release. The repo-root
+`package.json` also describes an npm package; it isn't published to npm.
