@@ -1,15 +1,14 @@
 {
   "name": "gb-gbc-gba-test-mcp",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "description": "MCP server + headless harness to test Game Boy / Color / Advance games in EmulatorJS (mgba + gambatte): input, screenshots, save states, deterministic playback, and real RAM read/write — no third-party emulator.",
   "keywords": ["mcp", "gba", "gb", "gbc", "gameboy", "emulator", "mgba", "gambatte", "emulatorjs", "testing", "ai", "game-testing"],
   "license": "GPL-3.0-or-later",
-  "bin": {
-    "gb-gbc-gba-test-mcp": "mcp-server.mjs"
-  },
+  "private": true,
   "scripts": {
     "mcp": "node mcp-server.mjs",
+    "typecheck": "tsc -p .",
     "postinstall": "playwright install chromium",
     "shot": "node driver.mjs shot",
     "run-script": "node runner.mjs",
@@ -24,7 +23,8 @@
     "test": "node tests/smoke.mjs && node tests/determinism.mjs && node tests/memory.mjs && node tests/write.mjs && node tests/gb.mjs && node tests/gb-determinism.mjs && node tests/gb-cgb.mjs && node tests/fastforward.mjs && node tests/ramsearch.mjs && node tests/features.mjs && node tests/mcp.mjs",
     "mcp-test": "node tests/mcp.mjs",
     "features": "node tests/features.mjs",
-    "ramsearch": "node tests/ramsearch.mjs"
+    "ramsearch": "node tests/ramsearch.mjs",
+    "package-test": "node tests/package.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
@@ -32,6 +32,10 @@
     "zod": "^4.5.2"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3"
   }
 }

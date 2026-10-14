@@ -53,7 +53,7 @@ export function gbSprites(regions, { cgb = false } = {}) {
       index: i, x, y, w: 8, h, tile: tall ? tile & 0xfe : tile,
       palette: cgb ? f & 7 : (f >> 4) & 1, priority: f & 0x80 ? 'behind-bg' : 'above-bg',
       hflip: !!(f & 0x20), vflip: !!(f & 0x40), bank: cgb ? (f >> 3) & 1 : 0,
-      hidden: !objOn, onScreen: objOn && x > -8 && x < 160 && y > -h && y < 144,
+      affine: false, hidden: !objOn, onScreen: objOn && x > -8 && x < 160 && y > -h && y < 144,
     });
   }
   return out;

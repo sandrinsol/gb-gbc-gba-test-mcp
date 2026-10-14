@@ -12,7 +12,10 @@ import { decodePng, encodePng } from './png.mjs';
 
 /** Compare two PNG buffers. `ignore` is a list of {x, y, w, h} rectangles (image
  *  pixels) left out of the comparison — clocks, timers, random sparkles.
- *  @returns {{ width, height, diffPixels, totalPixels, fraction, diffPng }} */
+ *  @param {Buffer} aBuf @param {Buffer} bBuf
+ *  @param {{ tolerance?: number, ignore?: Array<{x: number, y: number, w: number, h: number}> }} [opts]
+ *  @returns {{ width: number, height: number, diffPixels: number, totalPixels: number, fraction: number,
+ *    mismatchDimensions: boolean, diffPng: Buffer | null, diffPath?: string }} */
 export function compare(aBuf, bBuf, { tolerance = 16, ignore = [] } = {}) {
   const a = decodePng(aBuf);
   const b = decodePng(bBuf);
@@ -62,6 +65,7 @@ export function compare(aBuf, bBuf, { tolerance = 16, ignore = [] } = {}) {
 /** Assert a screenshot matches a golden PNG on disk.
  *  Missing golden, or env UPDATE_GOLDENS=1, writes the golden and passes.
  *  On mismatch above `threshold`, writes `<golden>.diff.png` and throws. */
+/** @returns {Promise<any>} { created, pass, fraction, goldenPath, threshold?, diffPath?, diffPng?, mismatchDimensions? } */
 export async function assertGolden(candidateBuf, goldenPath, { threshold = 0.02, tolerance = 16, ignore = [] } = {}) {
   const abs = path.resolve(process.cwd(), goldenPath);
   const update = process.env.UPDATE_GOLDENS === '1';

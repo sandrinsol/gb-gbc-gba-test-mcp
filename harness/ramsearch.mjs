@@ -51,13 +51,15 @@ function reader(width, signed) {
 }
 
 export class RamSearch {
-  /** @param system 'gba' | 'gb'
-   *  @param regions parsed RAM regions (EmuHarness#readRegions)
-   *  @param opts.type  u8|u16|u32|s8|s16|s32 (little-endian)
-   *  @param opts.region restrict to one area name (e.g. 'iwram', 'wram') */
-  constructor(system, regions, { type = 'u8', region } = {}) {
+  /** @param {string} system 'gba' | 'gb'
+   *  @param {any} regions parsed RAM regions (EmuHarness#readRegions)
+   *  @param {object} [opts]
+   *  @param {string} [opts.type]  u8|u16|u32|s8|s16|s32 (little-endian)
+   *  @param {string} [opts.region] restrict to one area name (e.g. 'iwram', 'wram') */
+  constructor(system, regions, { type = 'u8', region = undefined } = {}) {
     if (!TYPES[type]) throw new Error(`type must be one of ${SEARCH_TYPES.join(', ')}`);
-    [this.width, this.signed] = TYPES[type];
+    /** @type {number} */ this.width = TYPES[type][0];
+    /** @type {boolean} */ this.signed = TYPES[type][1];
     this.type = type; this.system = system;
     this.read = reader(this.width, this.signed);
     let areas = searchAreas(system, regions);

@@ -37,6 +37,7 @@ const client = new Client({ name: 'test', version: '0' });
 const [ct, st] = InMemoryTransport.createLinkedPair();
 await Promise.all([server.connect(st), client.connect(ct)]);
 
+/** @returns {Promise<any>} */
 const call = (name, args = {}) => client.callTool({ name, arguments: args });
 const textOf = (r) => r.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n');
 const images = (r) => r.content.filter((c) => c.type === 'image').map((c) => decodePng(Buffer.from(c.data, 'base64')));
@@ -133,9 +134,9 @@ try {
   ok('run_sequence rejects unknown steps', r.isError && /unknown step/.test(textOf(r)));
 
   // --- Resources ---
-  const res = await client.readResource({ uri: 'emu://status' });
+  const res = /** @type {any} */ (await client.readResource({ uri: 'emu://status' }));
   ok('emu://status resource', JSON.parse(res.contents[0].text).system === 'GBA');
-  const scr = await client.readResource({ uri: 'emu://screen' });
+  const scr = /** @type {any} */ (await client.readResource({ uri: 'emu://screen' }));
   ok('emu://screen resource is a PNG', decodePng(Buffer.from(scr.contents[0].blob, 'base64')).width === 240);
 
   // --- Golden ignore masks ---

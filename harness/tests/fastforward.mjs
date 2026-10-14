@@ -43,7 +43,7 @@ const recov = await scriptedRun({ fast: true, forceOvershoot: true });
 console.log(`timing: 1x ${slow.ms}ms, fast ${fast.ms}ms (${fast.stats.ffWaits} ff waits), recovery run ${recov.ms}ms (${recov.stats.recoveries} recoveries)`);
 ok('fast-forward was used', fast.stats.ffWaits > 0);
 ok('forced overshoot exercised recovery', recov.stats.recoveries === 1, `${recov.stats.recoveries}`);
-for (const [name, run] of [['fast', fast], ['recovery', recov]]) {
+for (const [name, run] of /** @type {Array<[string, any]>} */ ([['fast', fast], ['recovery', recov]])) {
   for (let i = 0; i < slow.shots.length; i++) {
     const d = compare(slow.shots[i], run.shots[i]).fraction;
     ok(`${name} frame ${i} identical to 1x`, d === 0, `${(d * 100).toFixed(3)}% differ`);

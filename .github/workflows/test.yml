@@ -7,7 +7,16 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        node: [20, 22, 24]
+        include:
+          - os: macos-latest
+            node: 22
     defaults:
       run:
         working-directory: harness
@@ -16,17 +25,39 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: npm
           cache-dependency-path: harness/package-lock.json
 
-      # Skip the postinstall playwright download here; we install the browser
-      # WITH its system deps in the next step (needed on CI runners).
+      # Skip the postinstall playwright download here; the browser is cached below.
       - run: npm ci --ignore-scripts
 
-      - run: npx playwright install --with-deps chromium
+      - name: Playwright version
+        id: pw
+        shell: bash
+        run: echo "version=$(node -p "require('./package-lock.json').packages['node_modules/playwright'].version")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ms-playwright
+            ~/Library/Caches/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
+      # Downloads only on a cache miss; on Linux also installs the system libraries.
+      - if: runner.os == 'Linux'
+        run: npx playwright install --with-deps chromium
+      - if: runner.os != 'Linux'
+        run: npx playwright install chromium
+
+      - if: matrix.os == 'ubuntu-latest' && matrix.node == 22
+        run: npm run typecheck
 
       # Boots the mgba + gambatte cores headlessly (software WebGL via SwiftShader)
       # and runs the full suite: smoke, determinism/input, fast-forward, RAM
-      # read/write/search, GB/GBC, and the MCP server end to end.
+      # read/write/search, GB/GBC, reset/waitFor, and the MCP server end to end.
       - run: npm test
+
+      # npm pack -> install into an empty project -> drive a ROM through the bin.
+      - if: matrix.os == 'ubuntu-latest' && matrix.node == 22
+        run: npm run package-test

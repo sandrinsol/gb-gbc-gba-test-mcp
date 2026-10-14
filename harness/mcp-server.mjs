@@ -44,8 +44,9 @@ const png = (buf) => ({ type: 'image', data: buf.toString('base64'), mimeType: '
 /** Build an MCP server with its own emulator session. Options:
  *  - root: base dir for relative paths (else $GBTEST_ROOT, the client's first
  *    file:// root, or the process cwd)
- *  - fast: default fast-forward setting for load_rom */
-export function createServer({ root, fast = true } = {}) {
+ *  - fast: default fast-forward setting for load_rom
+ *  @param {{ root?: string, fast?: boolean }} [opts] */
+export function createServer({ root = undefined, fast = true } = {}) {
   // ---- Session (one ROM at a time) ----
   let emu = null;
   let romName = null, romPath = null;
@@ -745,7 +746,8 @@ States saved here are shared with save_state/load_state.`,
   }, serial(async (uri) => ({ contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify(await statusData()) }] })));
 
   // ---- Prompts: reusable workflows that orchestrate the tools above ----
-  const userMsg = (t) => ({ messages: [{ role: 'user', content: { type: 'text', text: t } }] });
+  /** @param {string} t */
+  const userMsg = (t) => ({ messages: [{ role: /** @type {const} */ ('user'), content: { type: /** @type {const} */ ('text'), text: t } }] });
 
   server.registerPrompt('smoke_test_rom', {
     title: 'Smoke-test a ROM',

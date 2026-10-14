@@ -65,12 +65,16 @@ const asList = (b) => (Array.isArray(b) ? b : [b]);
 
 /**
  * Run `steps` against an EmuHarness.
- * @param opts.outDir   write screenshots here (optional)
- * @param opts.baseDir  resolve relative `assert` golden paths against this
- * @param opts.states   Map of named states (shared with the caller, optional)
- * @param opts.log      (msg) => void
- * @param opts.checkWrite (absPath) => void, throws to refuse writing there
- * @returns {{ timeline, shots: [{name, frame, png, file?}], records: [{prefix, frames, pngs}], failures }}
+ * @param {import('./driver.mjs').EmuHarness} emu
+ * @param {Array<Record<string, any>>} steps
+ * @param {object} [opts]
+ * @param {string} [opts.outDir]   write screenshots here
+ * @param {string} [opts.baseDir]  resolve relative paths (goldens, state/save files) against this
+ * @param {Map<string, Buffer>} [opts.states]  named states (shared with the caller)
+ * @param {(msg: string) => void} [opts.log]
+ * @param {(absPath: string) => void} [opts.checkWrite]  throws to refuse writing there
+ * @returns {Promise<{ timeline: any[], shots: Array<{name: string, frame: number, png: Buffer, file?: string}>,
+ *   records: Array<{prefix: string, frames: number[], pngs: Buffer[], files: string[]}>, failures: number }>}
  */
 export async function runSteps(emu, steps, { outDir, baseDir = process.cwd(), states = new Map(), log = () => {}, checkWrite = () => {} } = {}) {
   if (!Array.isArray(steps)) throw new Error('steps must be an array');
