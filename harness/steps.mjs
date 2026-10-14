@@ -12,10 +12,17 @@
 //   { "read": "0x03000010", "as": "u16", "name": "hp" }   record a RAM value
 //   { "write": "0x03000010", "value": 1, "as": "u8" }     set-up poke
 //   { "assertRam": "0x03000010", "as": "u16", "equals": 3, "name": "hp" }
-//   { "assert": "goldens/title.png", "threshold": 0.02, "name": "title" }
+//   { "assert": "goldens/title.png", "threshold": 0.02, "name": "title",
+//     "ignore": [{ "x": 200, "y": 0, "w": 40, "h": 16 }] }
+//   { "waitUntil": { "address": "0xC000", "op": "eq", "value": 3 }, "maxFrames": 600 }
+//   { "waitUntil": { "screen": "stable", "frames": 30 } }
+//   { "reset": true }                               reset button (battery save kept)
+//   { "cheats": ["01AAD0C0"] }                      replace the active cheat codes
+//   { "loadStateFile": "states/boss.state" }        a state saved to disk
+//   { "importSave": "saves/100pct.sav" }            load a battery save + reset
 
 import path from 'node:path';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import { assertGolden } from './assert.mjs';
 
 /** Parse a bus address given as a number or a string ("0x03000010", "$C000",
@@ -62,11 +69,12 @@ const asList = (b) => (Array.isArray(b) ? b : [b]);
  * @param opts.baseDir  resolve relative `assert` golden paths against this
  * @param opts.states   Map of named states (shared with the caller, optional)
  * @param opts.log      (msg) => void
+ * @param opts.checkWrite (absPath) => void, throws to refuse writing there
  * @returns {{ timeline, shots: [{name, frame, png, file?}], records: [{prefix, frames, pngs}], failures }}
  */
-export async function runSteps(emu, steps, { outDir, baseDir = process.cwd(), states = new Map(), log = () => {} } = {}) {
+export async function runSteps(emu, steps, { outDir, baseDir = process.cwd(), states = new Map(), log = () => {}, checkWrite = () => {} } = {}) {
   if (!Array.isArray(steps)) throw new Error('steps must be an array');
-  if (outDir) await mkdir(outDir, { recursive: true });
+  if (outDir) { checkWrite(outDir); await mkdir(outDir, { recursive: true }); }
   const timeline = [], shots = [], records = [];
   let seq = 0, failures = 0;
 
@@ -150,13 +158,34 @@ export async function runSteps(emu, steps, { outDir, baseDir = process.cwd(), st
       entry.action = `assertRam ${name}`;
       entry.assert = { value: val, pass, ...('equals' in step ? { equals: step.equals } : {}), ...('min' in step ? { min: step.min } : {}), ...('max' in step ? { max: step.max } : {}) };
       if (!pass) { failures++; log(`  ✗ assertRam ${name}: ${val}`); } else log(`  ✓ assertRam ${name} = ${val}`);
+    } else if ('waitUntil' in step) {
+      const c = { ...step.waitUntil };
+      if (c.address !== undefined) c.address = parseAddress(c.address);
+      const r = await emu.waitFor(c, { maxFrames: step.maxFrames ?? 600, precise: !!step.precise });
+      entry.action = `waitUntil ${JSON.stringify(step.waitUntil)}`;
+      entry.met = r.met; entry.metFrame = r.frame;
+      if (!r.met && step.required !== false) { failures++; log(`  ✗ waitUntil not met within ${step.maxFrames ?? 600} frames`); }
+    } else if ('reset' in step) {
+      entry.action = 'reset';
+      await emu.restart();
+    } else if ('cheats' in step) {
+      entry.action = `cheats ${step.cheats.length}`;
+      await emu.setCheats(step.cheats);
+    } else if ('loadStateFile' in step) {
+      entry.action = `loadStateFile ${step.loadStateFile}`;
+      await emu.loadState(await readFile(path.resolve(baseDir, step.loadStateFile)));
+    } else if ('importSave' in step) {
+      entry.action = `importSave ${step.importSave}`;
+      await emu.writeSaveData(await readFile(path.resolve(baseDir, step.importSave)), { reset: step.reset !== false });
     } else if ('assert' in step) {
       const name = step.name || path.basename(step.assert).replace(/\.png$/i, '');
       entry.action = `assert ${name}`;
       const s = await snap(name);
       if (s.file) entry.file = s.file;
-      const res = await assertGolden(s.png, path.resolve(baseDir, step.assert), {
-        threshold: step.threshold ?? 0.02, tolerance: step.tolerance ?? 16,
+      const golden = path.resolve(baseDir, step.assert);
+      checkWrite(golden);
+      const res = await assertGolden(s.png, golden, {
+        threshold: step.threshold ?? 0.02, tolerance: step.tolerance ?? 16, ignore: step.ignore ?? [],
       });
       entry.assert = {
         golden: res.goldenPath, created: res.created, pass: res.pass,

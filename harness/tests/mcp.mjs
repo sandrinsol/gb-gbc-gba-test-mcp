@@ -5,13 +5,13 @@
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { writeFile, mkdir, rm } from 'node:fs/promises';
+import { writeFile, readFile, mkdir, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from '../mcp-server.mjs';
 import { decodePng, encodePng } from '../png.mjs';
-import { makeInteractiveGbRom } from './gb-roms.mjs';
+import { makeInteractiveGbRom, makeBatteryGbRom, makeVblankGbRom } from './gb-roms.mjs';
 
 const HARNESS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = path.join(HARNESS, 'out', 'mcp-test');
@@ -26,6 +26,10 @@ await rm(OUT, { recursive: true, force: true });
 await mkdir(OUT, { recursive: true });
 const gbRom = path.join(OUT, 'input.gb');
 await writeFile(gbRom, makeInteractiveGbRom());
+const saveRom = path.join(OUT, 'save.gb');
+await writeFile(saveRom, makeBatteryGbRom());
+const vblankRom = path.join(OUT, 'vblank.gb');
+await writeFile(vblankRom, makeVblankGbRom());
 
 // Relative paths resolve against `root` (here: the repo root).
 const { server, close } = createServer({ root: path.resolve(HARNESS, '..') });
@@ -43,11 +47,12 @@ try {
   const names = tools.map((t) => t.name);
   for (const n of ['load_rom', 'wait_frames', 'press', 'set_button', 'screenshot', 'read_memory', 'write_memory',
     'save_state', 'load_state', 'assert_golden', 'run_sequence', 'ram_search_start', 'ram_search_filter',
-    'ram_search_results', 'frame_number', 'reset', 'status']) ok(`tool listed: ${n}`, names.includes(n));
+    'ram_search_results', 'frame_number', 'reset', 'status', 'wait_until', 'read_cpu', 'read_sprites', 'view_vram',
+    'set_cheats', 'export_save', 'import_save', 'export_script', 'ab_compare']) ok(`tool listed: ${n}`, names.includes(n));
   ok('screenshot is annotated read-only', tools.find((t) => t.name === 'screenshot').annotations?.readOnlyHint === true);
   ok('read_memory has an output schema', !!tools.find((t) => t.name === 'read_memory').outputSchema);
   const { prompts } = await client.listPrompts();
-  ok('prompts listed', ['smoke_test_rom', 'regression_check', 'find_ram_address'].every((p) => prompts.some((x) => x.name === p)));
+  ok('prompts listed', ['smoke_test_rom', 'regression_check', 'find_ram_address', 'record_regression_test'].every((p) => prompts.some((x) => x.name === p)));
   const { resources } = await client.listResources();
   ok('resources listed', ['emu://screen', 'emu://status'].every((u) => resources.some((r) => r.uri === u)));
 
@@ -133,6 +138,54 @@ try {
   const scr = await client.readResource({ uri: 'emu://screen' });
   ok('emu://screen resource is a PNG', decodePng(Buffer.from(scr.contents[0].blob, 'base64')).width === 240);
 
+  // --- Golden ignore masks ---
+  r = await call('assert_golden', { golden: 'harness/out/mcp-test/black.png', threshold: 0, ignore: [{ x: 0, y: 0, w: 240, h: 160 }] });
+  ok('assert_golden ignore mask', !r.isError && r.structuredContent.pass === true, textOf(r));
+
+  // --- Path safety ---
+  r = await call('screenshot', { save: '/tmp/gbtest-outside.png' });
+  ok('writes outside the workspace are refused', r.isError && /refusing to write/.test(textOf(r)));
+
+  // --- wait_until / CPU / sprites / VRAM / cheats on GBA ---
+  r = await call('wait_until', { screen: 'stable', frames: 10, maxFrames: 600 });
+  ok('wait_until screen stable', !r.isError && r.structuredContent.met, textOf(r));
+  r = await call('read_cpu');
+  ok('read_cpu (GBA)', !r.isError && typeof r.structuredContent.cpu.pc === 'number' && /pc=0x/.test(textOf(r)), textOf(r).split('\n')[0]);
+  r = await call('read_sprites');
+  ok('read_sprites returns overlay', !r.isError && images(r).length === 1 && images(r)[0].width === 720, textOf(r).split('\n')[0]);
+  r = await call('view_vram', { what: 'tiles', region: 'obj' });
+  ok('view_vram GBA obj tiles 256x256 @2x', images(r)[0]?.width === 512 && images(r)[0]?.height === 512);
+  r = await call('view_vram', { what: 'palettes' });
+  ok('view_vram palettes', !r.isError && images(r).length === 1);
+  r = await call('set_cheats', { codes: ['32000100 0042'] });
+  await call('wait_frames', { frames: 2 });
+  r = await call('read_memory', { address: '0x02000100', length: 1, as: 'u8' });
+  ok('GBA CodeBreaker cheat applies', r.structuredContent.values[0] === 0x42, textOf(r));
+  await call('set_cheats', { codes: [] });
+  r = await call('reset');
+  ok('reset restarts the clock at frame 1', /Frame 1\./.test(textOf(r)), textOf(r));
+
+  // --- export_script: record a session, replay it, same final frame ---
+  await call('load_rom', { rom: 'anguna.gba' });
+  await call('wait_frames', { frames: 200 });
+  await call('press', { button: 'START', hold: 6, release: 20 });
+  await call('set_button', { button: 'RIGHT', pressed: true });
+  await call('wait_until', { screen: 'changed', maxFrames: 300 });
+  await call('wait_frames', { frames: 40 });
+  await call('set_button', { button: 'RIGHT', pressed: false });
+  await call('write_memory', { address: '0x02000200', value: 9 });
+  await call('wait_frames', { frames: 20 });
+  const endShot = (await call('screenshot', { scale: 1 })).content[1].data;
+  const endFrame = (await call('frame_number')).structuredContent.frame;
+  r = await call('export_script', { path: 'harness/out/mcp-test/session.json' });
+  ok('export_script writes a script', !r.isError && existsSync(path.join(OUT, 'session.json')) && r.structuredContent.steps.length >= 6, `${r.structuredContent.steps?.length} steps`);
+  const script = r.structuredContent;
+  await call('load_rom', { rom: 'anguna.gba' });
+  r = await call('run_sequence', { steps: script.steps });
+  ok('exported script replays', !r.isError, textOf(r).split('\n')[0]);
+  ok('replay ends on the same frame', r.structuredContent.frame === endFrame, `${r.structuredContent.frame} vs ${endFrame}`);
+  ok('replay ends on the same picture', (await call('screenshot', { scale: 1 })).content[1].data === endShot);
+
   // --- A state file from a fresh session: picture unknown -> flagged stale ---
   await call('load_rom', { rom: 'anguna.gba' });
   await call('wait_frames', { frames: 10 });
@@ -163,8 +216,60 @@ try {
   ok('delta filter keeps it', r.structuredContent.count === 1);
   r = await call('status');
   ok('status reports search + system', r.structuredContent.system === 'GB/GBC' && r.structuredContent.ramSearch === 1, textOf(r));
+  r = await call('wait_until', { address: '0xC000', op: 'eq', value: 0x0f, maxFrames: 60 });
+  ok('wait_until already true returns at once', r.structuredContent.met && r.structuredContent.waited === 0, textOf(r));
+  const f0 = (await call('frame_number')).structuredContent.frame;
+  await call('set_button', { button: 'B', pressed: true });
+  r = await call('wait_until', { address: '0xC000', op: 'changed', maxFrames: 60 });
+  ok('wait_until stops on the first frame', r.structuredContent.met && r.structuredContent.frame === f0 + 1, textOf(r));
+  await call('set_button', { button: 'B', pressed: false });
+  r = await call('read_cpu');
+  ok('read_cpu (GB) pc in the ROM loop', r.structuredContent.cpu.pc >= 0x150 && r.structuredContent.cpu.pc < 0x180, textOf(r));
+  // Clear OAM (it powers on random, like real hardware), put one sprite in it and
+  // turn sprites on: read_sprites must find exactly that one.
+  await call('write_memory', { address: '0xFE00', hex: '50500100' + '00'.repeat(156) });
+  await call('write_memory', { address: '0xFF40', value: 0x93 });
+  r = await call('read_sprites', { overlay: false });
+  ok('read_sprites (GB) finds the poked sprite', r.structuredContent.sprites.length === 1 && r.structuredContent.sprites[0].x === 72 && r.structuredContent.sprites[0].y === 64, textOf(r));
+  r = await call('view_vram');
+  ok('view_vram GB tiles 128x192 @2x', images(r)[0]?.width === 256 && images(r)[0]?.height === 384);
+  r = await call('export_save', { path: 'harness/out/mcp-test/none.sav' });
+  ok('export_save errors when the game has no battery', r.isError && /no battery save/.test(textOf(r)));
+
+  // --- Battery saves ---
+  await call('load_rom', { rom: saveRom });
+  await call('wait_frames', { frames: 10 });
+  const sav = Buffer.alloc(8192); sav[0] = 0x42;
+  await writeFile(path.join(OUT, 'in.sav'), sav);
+  r = await call('import_save', { path: 'harness/out/mcp-test/in.sav' });
+  ok('import_save resets the game', !r.isError && r.structuredContent.frame === 1, textOf(r));
+  r = await call('read_memory', { address: '0xC000', length: 1, as: 'u8' });
+  ok('game booted with the imported save', r.structuredContent.values[0] === 0x42, textOf(r));
+  r = await call('export_save', { path: 'harness/out/mcp-test/out.sav' });
+  const outSav = await readFile(path.join(OUT, 'out.sav'));
+  ok('export_save has what the game wrote', !r.isError && outSav.length === 8192 && outSav[1] === 0x43, `A001=${outSav[1]}`);
   r = await call('reset');
-  ok('reset', !r.isError, textOf(r));
+  r = await call('read_memory', { address: '0xC000', length: 1, as: 'u8' });
+  ok('reset keeps the battery save', r.structuredContent.values[0] === 0x42);
+
+  // --- GB GameShark (applied at VBlank) ---
+  await call('load_rom', { rom: vblankRom });
+  await call('wait_frames', { frames: 10 });
+  await call('set_cheats', { codes: ['01AAD0C0'] });
+  await call('wait_frames', { frames: 3 });
+  r = await call('read_memory', { address: '0xC0D0', length: 1, as: 'u8' });
+  ok('GB GameShark cheat applies', r.structuredContent.values[0] === 0xaa, textOf(r));
+  r = await call('status');
+  ok('status lists cheats', r.structuredContent.cheats.length === 1);
+
+  // --- A/B compare ---
+  const steps = [{ wait: 20 }, { shot: 'a' }, { read: '0xC000' }];
+  r = await call('ab_compare', { romA: gbRom, romB: gbRom, steps });
+  ok('ab_compare: same ROM is identical', !r.isError && r.structuredContent.identical === true, textOf(r).split('\n')[0]);
+  r = await call('ab_compare', { romA: gbRom, romB: saveRom, steps });
+  ok('ab_compare: different ROMs differ', !r.isError && r.structuredContent.identical === false, textOf(r));
+  r = await call('status');
+  ok('ab_compare leaves the session alone', r.structuredContent.rom === vblankRom);
 } finally {
   await client.close();
   await close();

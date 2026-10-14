@@ -10,9 +10,10 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { decodePng, encodePng } from './png.mjs';
 
-/** Compare two PNG buffers.
+/** Compare two PNG buffers. `ignore` is a list of {x, y, w, h} rectangles (image
+ *  pixels) left out of the comparison — clocks, timers, random sparkles.
  *  @returns {{ width, height, diffPixels, totalPixels, fraction, diffPng }} */
-export function compare(aBuf, bBuf, { tolerance = 16 } = {}) {
+export function compare(aBuf, bBuf, { tolerance = 16, ignore = [] } = {}) {
   const a = decodePng(aBuf);
   const b = decodePng(bBuf);
   if (a.width !== b.width || a.height !== b.height) {
@@ -23,14 +24,20 @@ export function compare(aBuf, bBuf, { tolerance = 16 } = {}) {
     };
   }
   const { width, height } = a;
-  const total = width * height;
-  const out = new Uint8Array(total * 3); // RGB diff image
-  let diffPixels = 0;
+  const out = new Uint8Array(width * height * 3); // RGB diff image
+  let diffPixels = 0, total = 0;
+  const ignored = (x, y) => ignore.some((r) => x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h);
 
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const ia = (y * width + x) * a.channels;
       const ib = (y * width + x) * b.channels;
+      if (ignore.length && ignored(x, y)) {
+        const o = (y * width + x) * 3;
+        out[o] = 0; out[o + 1] = 0; out[o + 2] = 96; // masked: dark blue
+        continue;
+      }
+      total++;
       const dr = Math.abs(a.data[ia] - b.data[ib]);
       const dg = Math.abs(a.data[ia + 1] - b.data[ib + 1]);
       const db = Math.abs(a.data[ia + 2] - b.data[ib + 2]);
@@ -47,7 +54,7 @@ export function compare(aBuf, bBuf, { tolerance = 16 } = {}) {
   }
   return {
     width, height, diffPixels, totalPixels: total,
-    fraction: diffPixels / total, mismatchDimensions: false,
+    fraction: total ? diffPixels / total : 0, mismatchDimensions: false,
     diffPng: encodePng({ width, height, data: out }),
   };
 }
@@ -55,7 +62,7 @@ export function compare(aBuf, bBuf, { tolerance = 16 } = {}) {
 /** Assert a screenshot matches a golden PNG on disk.
  *  Missing golden, or env UPDATE_GOLDENS=1, writes the golden and passes.
  *  On mismatch above `threshold`, writes `<golden>.diff.png` and throws. */
-export async function assertGolden(candidateBuf, goldenPath, { threshold = 0.02, tolerance = 16 } = {}) {
+export async function assertGolden(candidateBuf, goldenPath, { threshold = 0.02, tolerance = 16, ignore = [] } = {}) {
   const abs = path.resolve(process.cwd(), goldenPath);
   const update = process.env.UPDATE_GOLDENS === '1';
   if (!existsSync(abs) || update) {
@@ -64,7 +71,7 @@ export async function assertGolden(candidateBuf, goldenPath, { threshold = 0.02,
     return { created: true, updated: existsSync(abs) && update, fraction: 0, pass: true, goldenPath: abs };
   }
   const goldenBuf = await readFile(abs);
-  const res = compare(goldenBuf, candidateBuf, { tolerance });
+  const res = compare(goldenBuf, candidateBuf, { tolerance, ignore });
   const pass = res.fraction <= threshold && !res.mismatchDimensions;
   if (!pass && res.diffPng) {
     const diffPath = abs.replace(/\.png$/i, '') + '.diff.png';
