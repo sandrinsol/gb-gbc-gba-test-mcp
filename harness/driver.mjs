@@ -17,9 +17,9 @@
 
 import http from 'node:http';
 import { readFile, writeFile, stat, unlink, mkdir } from 'node:fs/promises';
-import { createReadStream } from 'node:fs';
+import { createReadStream, realpathSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as gbaMem from './memory.mjs';
 import * as gbMem from './gb-memory.mjs';
 
@@ -52,15 +52,45 @@ function startServer(rootDir) {
   });
 }
 
+// Browser + static server, launched once and shared by every `reuse: true` harness
+// (the MCP server uses this so load_rom doesn't cold-start Chromium each time).
+let sharedHost = null;
+
+async function startHost({ headless = true } = {}) {
+  const { chromium } = await import('playwright');
+  const { server, port } = await startServer(ROOT);
+  const browser = await chromium.launch({
+    headless,
+    // Optional: use a preinstalled Chromium instead of Playwright's download.
+    executablePath: process.env.GBTEST_CHROMIUM || undefined,
+    args: [
+      '--use-gl=angle', '--use-angle=swiftshader',
+      '--ignore-gpu-blocklist', '--enable-webgl',
+      '--autoplay-policy=no-user-gesture-required',
+      '--mute-audio', '--hide-scrollbars',
+    ],
+  });
+  return {
+    browser, server, port,
+    async close() { await browser.close().catch(() => {}); await new Promise((r) => server.close(r)); },
+  };
+}
+
 export class EmuHarness {
-  constructor({ browser, context, page, server, tempRom, system }) {
-    this.browser = browser; this.context = context; this.page = page; this.server = server;
+  constructor({ host, shared, context, page, tempRom, system, blocked }) {
+    this.host = host; this._shared = shared;
+    this.browser = host.browser; this.server = host.server;
+    this.context = context; this.page = page;
     this._tempRom = tempRom; // copied-in ROM to clean up on close (if any)
     this.system = system;    // 'gba' (mgba) or 'gb' (gambatte, covers GB + GBC)
+    this.blockedRequests = blocked; // external URLs the page tried to fetch (blocked: offline)
   }
 
-  static async launch(romPath, { headless = true, timeout = 60000 } = {}) {
-    const { chromium } = await import('playwright');
+  /** Boot a ROM. Options:
+   *  - fast (default true): fast-forward long waits (results stay bit-identical).
+   *  - reuse (default false): share one browser + server across harnesses; close()
+   *    then only closes this page. Call EmuHarness.shutdown() when done. */
+  static async launch(romPath, { headless = true, timeout = 60000, fast = true, reuse = false } = {}) {
     const absRom = path.resolve(process.cwd(), romPath);
     await stat(absRom).catch(() => { throw new Error(`ROM not found: ${absRom}`); });
 
@@ -68,32 +98,44 @@ export class EmuHarness {
     // and remember the copy so close() can remove it.
     let served = absRom, tempRom = null;
     if (!absRom.startsWith(ROOT + path.sep)) {
-      tempRom = path.join(ROOT, 'harness', 'out', `_rom_${process.pid}_${path.basename(absRom)}`);
+      await mkdir(path.join(ROOT, 'harness', 'out'), { recursive: true });
+      tempRom = path.join(ROOT, 'harness', 'out', `_rom_${process.pid}_${Date.now()}_${path.basename(absRom)}`);
       await writeFile(tempRom, await readFile(absRom));
       served = tempRom;
     }
     const romUrlPath = '/' + path.relative(ROOT, served).split(path.sep).map(encodeURIComponent).join('/');
 
-    const { server, port } = await startServer(ROOT);
-    const browser = await chromium.launch({
-      headless,
-      args: [
-        '--use-gl=angle', '--use-angle=swiftshader',
-        '--ignore-gpu-blocklist', '--enable-webgl',
-        '--autoplay-policy=no-user-gesture-required',
-        '--mute-audio', '--hide-scrollbars',
-      ],
-    });
-    const context = await browser.newContext({
+    let host;
+    if (reuse) {
+      if (!sharedHost || !sharedHost.browser.isConnected()) sharedHost = await startHost({ headless });
+      host = sharedHost;
+    } else {
+      host = await startHost({ headless });
+    }
+    const context = await host.browser.newContext({
       viewport: { width: 720, height: 480 }, deviceScaleFactor: 1, reducedMotion: 'reduce',
+    });
+    // Offline guard: everything is bundled, so any non-local request is a bug
+    // (e.g. EmulatorJS falling back to its CDN for a missing core). Block + record it.
+    const blocked = [];
+    await context.route('**/*', (route) => {
+      const u = new URL(route.request().url());
+      if (u.hostname === '127.0.0.1' || u.protocol === 'data:' || u.protocol === 'blob:') return route.continue();
+      blocked.push(u.href);
+      return route.abort('blockedbyclient');
     });
     const page = await context.newPage();
     const errors = [];
     page.on('pageerror', (e) => { errors.push(e.message); });
 
-    const url = `http://127.0.0.1:${port}/harness/page.html?rom=${encodeURIComponent(romUrlPath)}`;
-    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    const cleanup = async () => {
+      await context.close().catch(() => {});
+      if (!reuse) await host.close();
+      if (tempRom) await unlink(tempRom).catch(() => {});
+    };
+    const url = `http://127.0.0.1:${host.port}/harness/page.html?rom=${encodeURIComponent(romUrlPath)}${fast ? '' : '&fast=0'}`;
     try {
+      await page.goto(url, { waitUntil: 'domcontentloaded' });
       await page.waitForFunction(() => window.EJS_emulator && window.EJS_emulator.gameManager, { timeout });
       // Bound the wait for the 'start' event so a ROM that never boots fails fast.
       await page.evaluate((ms) => Promise.race([
@@ -101,13 +143,23 @@ export class EmuHarness {
         new Promise((_, rej) => setTimeout(() => rej(new Error('game did not start (ROM may be unsupported by this core)')), ms)),
       ]), timeout);
     } catch (e) {
-      await browser.close(); await new Promise((r) => server.close(r));
-      if (tempRom) await unlink(tempRom).catch(() => {});
-      throw new Error(`Emulator failed to start${errors.length ? ` (page errors: ${errors.join('; ')})` : ''}: ${e.message}`);
+      await cleanup();
+      const extra = [
+        errors.length ? `page errors: ${errors.join('; ')}` : '',
+        blocked.length ? `blocked external requests (missing bundled file?): ${blocked.join(', ')}` : '',
+      ].filter(Boolean).join('; ');
+      throw new Error(`Emulator failed to start${extra ? ` (${extra})` : ''}: ${e.message}`);
     }
 
-    const system = await page.evaluate(() => window.Emu.system);
-    return new EmuHarness({ browser, context, page, server, tempRom, system });
+    // Hold the machine still between calls (it only runs inside waits).
+    const system = await page.evaluate(() => { window.Emu.pause(); return window.Emu.system; });
+    return new EmuHarness({ host, shared: reuse, context, page, tempRom, system, blocked });
+  }
+
+  /** Close the shared browser + server used by `reuse: true` harnesses. */
+  static async shutdown() {
+    const h = sharedHost; sharedHost = null;
+    if (h) await h.close();
   }
 
   frameNum() { return this.page.evaluate(() => window.Emu.frameNum()); }
@@ -115,7 +167,13 @@ export class EmuHarness {
   waitFrames(n) { return this.page.evaluate((n) => window.Emu.waitFrames(n), n); }
   waitUntilFrame(abs) { return this.page.evaluate((a) => window.Emu.waitUntilFrame(a), abs); }
   setButton(name, pressed) { return this.page.evaluate(([n, p]) => window.Emu.setButton(n, p), [name, pressed]); }
+  /** Hold/release several buttons at once (e.g. ['A', 'B']). */
+  setButtons(names, pressed) { return this.page.evaluate(([n, p]) => window.Emu.setButtons(n, p), [names, pressed]); }
+  heldButtons() { return this.page.evaluate(() => window.Emu.heldButtons()); }
+  /** Press, hold `hold` frames, release, settle `release` frames. `name` may be an array (combo). */
   tap(name, hold = 4, release = 4) { return this.page.evaluate(([n, h, r]) => window.Emu.tap(n, h, r), [name, hold, release]); }
+  /** Fast-forward counters: { ffWaits, recoveries }. */
+  stats() { return this.page.evaluate(() => window.Emu.stats); }
   restart() { return this.page.evaluate(() => window.Emu.restart()); }
 
   async screenshot(outPath) {
@@ -182,14 +240,14 @@ export class EmuHarness {
   async writeU32(addr, v) { const b = Buffer.alloc(4); b.writeUInt32LE(v >>> 0); await this.writeMemory(addr, b); }
 
   async close() {
-    await this.browser?.close();
-    await new Promise((r) => this.server?.close(r));
+    await this.context?.close().catch(() => {});
+    if (!this._shared) await this.host?.close();
     if (this._tempRom) await unlink(this._tempRom).catch(() => {});
   }
 }
 
 // ---- CLI ----
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
   const [cmd, rom, framesArg, outArg] = process.argv.slice(2);
   if (cmd !== 'shot' || !rom) {
     console.error('Usage: node driver.mjs shot <rom> [frames=300] [out.png=out/shot.png]');
