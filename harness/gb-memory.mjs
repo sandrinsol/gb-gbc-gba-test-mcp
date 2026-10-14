@@ -47,6 +47,7 @@ export function parseState(state) {
     // IO page 0xFF00-0xFF7F lives inside the hram block at offset 0x100.
     io: hram.subarray(0x100, 0x180),
     isCgbWram: wram.length > 0x2000,
+    fields,
   };
 }
 
@@ -90,4 +91,42 @@ export function writeMemory(state, addr, data) {
     buf[off] = bytes[i];
   }
   return state;
+}
+
+// Offset of a region view inside the save-state buffer it was parsed from.
+const offsetIn = (state, view) => view.byteOffset - state.byteOffset;
+
+/** Save-state byte offsets of `length` bytes at a GB bus address. (A 0xD000-0xDFFF
+ *  address on CGB resolves to the WRAM bank selected right now.) */
+export function stateOffsets(state, addr, length = 1) {
+  const r = parseState(state);
+  return Array.from({ length }, (_, i) => { const [buf, o] = locate(r, (addr + i) & 0xffff); return offsetIn(state, buf) + o; });
+}
+
+/** [start, length] save-state ranges that determine the picture: VRAM, OAM, the
+ *  LCD registers (0xFF40-0xFF4B) and, when present, the palette fields. */
+export function videoRanges(state) {
+  const r = parseState(state);
+  const views = [r.vram, r.hram.subarray(0, 0xa0), r.hram.subarray(0x140, 0x14c)];
+  for (const k of ['bgp', 'objp', 'dmgpal']) if (r.fields[k]) views.push(r.fields[k]);
+  return views.map((v) => [offsetIn(state, v), v.length]);
+}
+
+/** The cartridge's battery-backed RAM (the .sav file) as a view into the state, or
+ *  null if the cartridge has none. Writing it patches the state. */
+export function saveData(state) {
+  const r = parseState(state);
+  return r.sram && r.sram.length ? r.sram : null;
+}
+
+/** SM83 registers from the state. */
+export function cpu(state) {
+  const f = parseState(state).fields;
+  const n = (k) => { const b = f[k]; if (!b) return undefined; let v = 0; for (const x of b) v = v * 256 + x; return v; };
+  const F = n('f');
+  return {
+    pc: n('pc'), sp: n('sp'), a: n('a'), f: F, b: n('b'), c: n('c'), d: n('d'), e: n('e'), h: n('h'), l: n('l'),
+    flags: { z: !!(F & 0x80), n: !!(F & 0x40), h: !!(F & 0x20), c: !!(F & 0x10) },
+    ime: !!n('ime'), halted: !!n('halt'),
+  };
 }

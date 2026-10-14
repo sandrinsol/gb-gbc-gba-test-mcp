@@ -19,12 +19,14 @@ import { readFileSync, realpathSync } from 'node:fs';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { EmuHarness } from './driver.mjs';
-import { assertGolden } from './assert.mjs';
+import { assertGolden, compare } from './assert.mjs';
 import { scalePng, contactSheet } from './png.mjs';
 import { RamSearch, SEARCH_OPS, SEARCH_TYPES } from './ramsearch.mjs';
 import { runSteps, parseAddress, decodeValues, encodeValue, VALUE_TYPES } from './steps.mjs';
+import { gbaSprites, gbSprites, drawBoxes, gbaPalettes, gbPalettes, palettesPng, gbaTilesPng, gbTilesPng } from './video.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const OUT_DIR = path.join(__dirname, 'out');
 const VERSION = JSON.parse(readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version;
 
 const BUTTONS = ['A', 'B', 'L', 'R', 'START', 'SELECT', 'UP', 'DOWN', 'LEFT', 'RIGHT'];
@@ -42,13 +44,16 @@ const png = (buf) => ({ type: 'image', data: buf.toString('base64'), mimeType: '
 /** Build an MCP server with its own emulator session. Options:
  *  - root: base dir for relative paths (else $GBTEST_ROOT, the client's first
  *    file:// root, or the process cwd)
- *  - fast: default fast-forward setting for load_rom */
-export function createServer({ root, fast = true } = {}) {
+ *  - fast: default fast-forward setting for load_rom
+ *  @param {{ root?: string, fast?: boolean }} [opts] */
+export function createServer({ root = undefined, fast = true } = {}) {
   // ---- Session (one ROM at a time) ----
   let emu = null;
   let romName = null, romPath = null;
   const states = new Map(); // id -> Buffer (save states)
   let search = null;        // active RamSearch
+  let rec = [];             // steps done since load_rom (export_script)
+  const record = (step) => { rec.push(step); };
 
   const server = new McpServer({ name: 'gb-gbc-gba-test-mcp', version: VERSION });
 
@@ -80,6 +85,19 @@ export function createServer({ root, fast = true } = {}) {
     return rootsDir || process.cwd();
   }
   const resolvePath = async (p) => (path.isAbsolute(p) ? p : path.resolve(await baseDir(), p));
+
+  // Files are only written inside the workspace root (or harness/out), so a
+  // confused or prompt-injected agent can't overwrite arbitrary files.
+  // GBTEST_ALLOW_ANY_PATH=1 lifts this.
+  const inside = (abs, dir) => { const rel = path.relative(dir, abs); return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel)); };
+  async function writeGuard() {
+    const roots = [await baseDir(), OUT_DIR];
+    return (abs) => {
+      if (process.env.GBTEST_ALLOW_ANY_PATH === '1' || roots.some((d) => inside(abs, d))) return;
+      throw new Error(`refusing to write outside the workspace (${roots.join(', ')}): ${abs}. Set GBTEST_ALLOW_ANY_PATH=1 to allow.`);
+    };
+  }
+  const writePath = async (p) => { const abs = await resolvePath(p); (await writeGuard())(abs); return abs; };
 
   // ---- Helpers ----
   function requireRom() {
@@ -119,7 +137,7 @@ export function createServer({ root, fast = true } = {}) {
     annotations: ACT,
   }, async ({ rom, fast: ff }) => {
     if (emu) { await emu.close().catch(() => {}); emu = null; }
-    states.clear(); search = null;
+    states.clear(); search = null; rec = [];
     const abs = await resolvePath(rom);
     emu = await EmuHarness.launch(abs, { reuse: true, fast: ff });
     romName = path.basename(abs); romPath = abs;
@@ -137,6 +155,7 @@ export function createServer({ root, fast = true } = {}) {
     annotations: ACT,
   }, async ({ frames }) => {
     await emu.waitFrames(frames);
+    record({ wait: frames });
     const frame = await emu.frameNum();
     return result(`Advanced to frame ${frame}.`, { frame });
   });
@@ -161,6 +180,7 @@ export function createServer({ root, fast = true } = {}) {
   }, async (args) => {
     const list = buttonsOf(args);
     await emu.tap(list, args.hold, args.release);
+    record({ tap: list.length === 1 ? list[0] : list, hold: args.hold, release: args.release });
     const frame = await emu.frameNum();
     return result(`Pressed ${list.join('+')} (hold ${args.hold}f). Now at frame ${frame}.`, { frame });
   });
@@ -174,6 +194,7 @@ export function createServer({ root, fast = true } = {}) {
   }, async (args) => {
     const list = buttonsOf(args);
     await emu.setButtons(list, args.pressed);
+    record(args.pressed ? { press: list } : { release: list });
     const held = await emu.heldButtons();
     return result(`${list.join('+')} ${args.pressed ? 'held' : 'released'}. Held now: ${held.join(', ') || 'none'}.`, { held });
   });
@@ -193,8 +214,9 @@ export function createServer({ root, fast = true } = {}) {
     const d = await emu.videoDimensions();
     const frame = await emu.frameNum();
     let saved;
+    record({ shot: `f${frame}` });
     if (save) {
-      saved = await resolvePath(save);
+      saved = await writePath(save);
       await mkdir(path.dirname(saved), { recursive: true });
       await writeFile(saved, buf);
     }
@@ -248,6 +270,7 @@ export function createServer({ root, fast = true } = {}) {
       return errText('provide `value` (with `as`) or `hex`');
     }
     const stuck = await emu.writeMemory(addr, bytes);
+    record({ write: hex(addr), hex: bytes.toString('hex') });
     const back = await emu.readMemory(addr, bytes.length);
     const text = `Wrote ${bytes.length}B @${hex(addr)}; read back: ${hexBytes(back)}` +
       (stuck ? '' : ' — WARNING: the value did not stick (not RAM-backed, or the game overwrote it).');
@@ -266,9 +289,10 @@ export function createServer({ root, fast = true } = {}) {
   }, async ({ id, path: p }) => {
     const st = await emu.saveState();
     states.set(id, st);
+    record({ saveState: id });
     let file;
     if (p) {
-      file = await resolvePath(p);
+      file = await writePath(p);
       await mkdir(path.dirname(file), { recursive: true });
       await writeFile(file, st);
     }
@@ -296,24 +320,29 @@ export function createServer({ root, fast = true } = {}) {
       if (!st) return errText(`No saved state "${id}". Saved: ${[...states.keys()].join(', ') || 'none'}.`);
     }
     await emu.loadState(st);
+    record(p ? { loadStateFile: await resolvePath(p) } : { loadState: id });
     const frame = await emu.frameNum();
     return result(`Restored state ${p ? `from ${p}` : `"${id}"`}. Frame ${frame}.`, { frame });
   });
 
   tool('assert_golden', {
     title: 'Assert golden frame',
-    description: 'Compare the current frame to a stored golden PNG (created on first call). Fails if more than `threshold` of pixels differ. On failure, returns the current frame, the golden and a red-highlighted diff inline.',
+    description: 'Compare the current frame to a stored golden PNG (created on first call). Fails if more than `threshold` of pixels differ. `ignore` masks rectangles that legitimately change (clocks, timers). On failure, returns the current frame, the golden and a red-highlighted diff inline.',
     inputSchema: {
       golden: z.string().describe('Path to the golden PNG (created if missing)'),
       threshold: z.number().min(0).max(1).default(0.02).describe('Max fraction of differing pixels'),
       tolerance: z.number().int().min(0).max(255).default(16).describe('Per-channel delta that counts as different'),
+      ignore: z.array(z.object({ x: z.number().int(), y: z.number().int(), w: z.number().int(), h: z.number().int() })).default([])
+        .describe('Rectangles (native pixels) to leave out, e.g. a clock: [{"x":200,"y":0,"w":40,"h":16}]'),
       scale: Scale.default(2),
     },
     outputSchema: { pass: z.boolean(), created: z.boolean(), fraction: z.number(), golden: z.string(), diff: z.string().optional() },
     annotations: ACT,
-  }, async ({ golden, threshold, tolerance, scale }) => {
+  }, async ({ golden, threshold, tolerance, ignore, scale }) => {
     const shot = await emu.screenshot();
-    const res = await assertGolden(shot, await resolvePath(golden), { threshold, tolerance });
+    const goldenPath = await writePath(golden);
+    const res = await assertGolden(shot, goldenPath, { threshold, tolerance, ignore });
+    record({ assert: goldenPath, threshold, tolerance, ...(ignore.length ? { ignore } : {}) });
     const out = { pass: res.pass, created: !!res.created, fraction: res.fraction ?? 0, golden: res.goldenPath, ...(res.diffPath ? { diff: res.diffPath } : {}) };
     if (res.created) return result(`Golden created at ${res.goldenPath} (baseline saved). Check it looks right:`, out, [png(scalePng(shot, scale))]);
     const pct = (res.fraction * 100).toFixed(2);
@@ -328,7 +357,7 @@ export function createServer({ root, fast = true } = {}) {
   tool('run_sequence', {
     title: 'Run input sequence',
     description: `Run a whole script of steps in ONE call (instead of many press/wait/screenshot calls) and get back a timeline plus the screenshots it took. Steps (one action key each):
-{"wait":60} | {"tap":"A"} or {"tap":["A","B"],"hold":4,"release":4} | {"press":"RIGHT"} / {"release":"RIGHT"} | {"hold":"RIGHT","frames":30} | {"shot":"name"} | {"record":{"frames":120,"every":20,"prefix":"walk"}} (returned as one contact-sheet image) | {"saveState":"cp"} / {"loadState":"cp"} | {"read":"0x03000010","as":"u16","name":"hp"} | {"write":"0x03000010","value":1,"as":"u8"} | {"assertRam":"0x03000010","as":"u16","equals":3} (or "min"/"max") | {"assert":"goldens/x.png","threshold":0.02}.
+{"wait":60} | {"tap":"A"} or {"tap":["A","B"],"hold":4,"release":4} | {"press":"RIGHT"} / {"release":"RIGHT"} | {"hold":"RIGHT","frames":30} | {"waitUntil":{"address":"0xC000","op":"eq","value":3},"maxFrames":600} or {"waitUntil":{"screen":"stable","frames":30}} | {"shot":"name"} | {"record":{"frames":120,"every":20,"prefix":"walk"}} (returned as one contact-sheet image) | {"saveState":"cp"} / {"loadState":"cp"} / {"loadStateFile":"x.state"} | {"read":"0x03000010","as":"u16","name":"hp"} | {"write":"0x03000010","value":1,"as":"u8"} | {"assertRam":"0x03000010","as":"u16","equals":3} (or "min"/"max") | {"assert":"goldens/x.png","threshold":0.02,"ignore":[{"x":0,"y":0,"w":40,"h":8}]} | {"reset":true} | {"cheats":["..."]} | {"importSave":"x.sav"}.
 States saved here are shared with save_state/load_state.`,
     inputSchema: {
       steps: z.array(z.record(z.string(), z.any())).min(1).describe('Steps to run in order'),
@@ -339,8 +368,15 @@ States saved here are shared with save_state/load_state.`,
     outputSchema: { pass: z.boolean(), failures: z.number(), frame: z.number(), timeline: z.array(z.record(z.string(), z.any())) },
     annotations: ACT,
   }, async ({ steps, scale, outDir, maxImages }) => {
-    const out = outDir ? await resolvePath(outDir) : undefined;
-    const res = await runSteps(emu, steps, { outDir: out, baseDir: await baseDir(), states });
+    const out = outDir ? await writePath(outDir) : undefined;
+    const bd = await baseDir();
+    const res = await runSteps(emu, steps, { outDir: out, baseDir: bd, states, checkWrite: await writeGuard() });
+    // Record with absolute paths so an exported script replays from anywhere.
+    for (const st of steps) {
+      const c = { ...st };
+      for (const k of ['assert', 'loadStateFile', 'importSave']) if (typeof c[k] === 'string') c[k] = path.resolve(bd, c[k]);
+      record(c);
+    }
     const frame = await emu.frameNum();
     if (out) await writeFile(path.join(out, 'timeline.json'), JSON.stringify({ rom: romPath, pass: res.failures === 0, steps: res.timeline }, null, 2));
 
@@ -372,6 +408,231 @@ States saved here are shared with save_state/load_state.`,
     const r = result(summary, { pass: res.failures === 0, failures: res.failures, frame, timeline: res.timeline }, images);
     return res.failures ? { ...r, isError: true } : r;
   });
+
+  // ---- Waiting on conditions ----
+  tool('wait_until', {
+    title: 'Wait until',
+    description: `Run the game until a condition holds, stopping on the FIRST frame where it does (or after maxFrames). Replaces "wait, read, check" loops. Give either a RAM condition (address + op + value, e.g. wait until HP at 0x03001a4c == 0, or op "changed") or a screen condition: screen "changed" (the picture's video memory differs from now — e.g. a menu opened) or "stable" (unchanged for \`frames\` frames — e.g. a screen transition finished). Fast-forwards while checking, then pins down the exact frame; precise=true checks every frame at 1x (catches conditions that are true for only a few frames).`,
+    inputSchema: {
+      address: Address.optional(),
+      as: z.enum(Object.keys(VALUE_TYPES)).default('u8'),
+      op: z.enum(['eq', 'ne', 'gt', 'lt', 'gte', 'lte', 'changed']).default('eq'),
+      value: z.number().int().optional(),
+      screen: z.enum(['changed', 'stable']).optional(),
+      frames: z.number().int().positive().default(30).describe('For screen "stable": how many unchanged frames'),
+      maxFrames: z.number().int().positive().max(216000).default(600),
+      precise: z.boolean().default(false),
+      screenshot: z.boolean().default(false).describe('Return a screenshot of the frame it stopped on'),
+      scale: Scale,
+    },
+    outputSchema: { met: z.boolean(), frame: z.number(), waited: z.number() },
+    annotations: ACT,
+  }, async ({ address, as, op, value, screen, frames, maxFrames, precise, screenshot, scale }) => {
+    let cond;
+    if (screen) cond = { screen, frames };
+    else if (address !== undefined) cond = { address: parseAddress(address), as, op, value };
+    else return errText('give `address` (+ op/value) or `screen`');
+    const before = await emu.waitTarget(), f0 = await emu.frameNum();
+    const r = await emu.waitFor(cond, { maxFrames, precise });
+    record({ wait: r.frame - before });
+    const what = screen ? `screen ${screen}${screen === 'stable' ? ` for ${frames} frames` : ''}` : `${hex(cond.address)} ${as} ${op}${op === 'changed' ? '' : ` ${value}`}`;
+    const text = r.met ? `Met (${what}) at frame ${r.frame}, after ${r.frame - f0} frames.` : `NOT met (${what}) within ${maxFrames} frames; stopped at frame ${r.frame}.`;
+    const extra = screenshot ? [png(scalePng(await emu.screenshot(), scale))] : [];
+    return result(text, { met: r.met, frame: r.frame, waited: r.frame - f0 }, extra);
+  });
+
+  // ---- CPU / video inspection ----
+  tool('read_cpu', {
+    title: 'Read CPU registers',
+    description: 'CPU registers on the current frame. GBA (ARM7): r0-r12, sp, lr, pc (+ the executing address after prefetch), cpsr mode/Thumb/flags. GB (SM83): pc, sp, a/f/b/c/d/e/h/l, flags, ime, halted. Handy to tell "hung in a loop" (pc stays put across waits) from "running".',
+    inputSchema: {},
+    outputSchema: { cpu: z.record(z.string(), z.any()) },
+    annotations: RO,
+  }, async () => {
+    const c = await emu.readCpu();
+    const h4 = (n) => '0x' + (n >>> 0).toString(16).padStart(8, '0'), h2 = (n) => '0x' + n.toString(16).padStart(4, '0'), h1 = (n) => n.toString(16).padStart(2, '0');
+    const text = emu.system === 'gba'
+      ? `pc=${h4(c.pc)} (executing ${h4(c.executing)}) ${c.thumb ? 'Thumb' : 'ARM'} mode=${c.mode} sp=${h4(c.sp)} lr=${h4(c.lr)} cpsr=${h4(c.cpsr)} [${['n', 'z', 'c', 'v'].filter((k) => c.flags[k]).join('').toUpperCase() || '-'}]${c.irqDisabled ? ' IRQs off' : ''}\n` +
+        c.r.map((v, i) => `r${i}=${h4(v)}`).join(' ')
+      : `pc=${h2(c.pc)} sp=${h2(c.sp)} af=${h1(c.a)}${h1(c.f)} bc=${h1(c.b)}${h1(c.c)} de=${h1(c.d)}${h1(c.e)} hl=${h1(c.h)}${h1(c.l)} flags=[${['z', 'n', 'h', 'c'].filter((k) => c.flags[k]).join('').toUpperCase() || '-'}] ime=${c.ime ? 1 : 0}${c.halted ? ' HALTED' : ''}`;
+    return result(`Frame ${await emu.frameNum()}: ${text}`, { cpu: c });
+  });
+
+  tool('read_sprites', {
+    title: 'Read sprites (OAM)',
+    description: 'Decode the sprite table: position, size, tile, palette, flips and priority of every hardware sprite, and (by default) a screenshot with the on-screen sprites outlined (box colours cycle; the list is in the same order). Use it to find the player/enemies on screen without a RAM search.',
+    inputSchema: {
+      all: z.boolean().default(false).describe('List all OAM entries, not just the ones on screen'),
+      overlay: z.boolean().default(true).describe('Return a screenshot with sprite boxes drawn'),
+      scale: Scale,
+    },
+    outputSchema: { sprites: z.array(z.record(z.string(), z.any())) },
+    annotations: RO,
+  }, async ({ all, overlay, scale }) => {
+    const r = await emu.readRegions();
+    const list = emu.system === 'gba' ? gbaSprites(r) : gbSprites(r, { cgb: !!r.isCgbWram });
+    const shown = all ? list : list.filter((s) => s.onScreen);
+    const visible = list.filter((s) => s.onScreen);
+    const lines = shown.map((s) => `#${s.index} x=${s.x} y=${s.y} ${s.w}x${s.h} tile=${s.tile} pal=${s.palette}${s.hflip ? ' hflip' : ''}${s.vflip ? ' vflip' : ''}${s.affine ? ' affine' : ''}${s.onScreen ? '' : ' (off-screen/hidden)'}`);
+    const extra = overlay ? [png(drawBoxes(await emu.screenshot(), visible, scale))] : [];
+    return result(`${visible.length} sprite(s) on screen (of ${list.length} OAM entries) at frame ${await emu.frameNum()}.${lines.length ? '\n' + lines.join('\n') : ''}`, { sprites: shown }, extra);
+  });
+
+  tool('view_vram', {
+    title: 'View tiles / palettes',
+    description: 'Render video memory as an image: what="tiles" shows the tile graphics (GBA: region "bg" char blocks or "obj" sprite tiles, 4bpp with palette bank `palette`, or bpp8; GB: the 384 tiles of VRAM bank `bank` with BG palette `palette`), what="palettes" shows every palette as colour swatches (BG rows first, then OBJ).',
+    inputSchema: {
+      what: z.enum(['tiles', 'palettes']).default('tiles'),
+      region: z.enum(['bg', 'obj']).default('bg').describe('GBA tiles: background or sprite tiles'),
+      palette: z.number().int().min(0).max(15).default(0),
+      bpp8: z.boolean().default(false).describe('GBA: decode as 256-colour tiles'),
+      bank: z.number().int().min(0).max(1).default(0).describe('GBC: VRAM bank'),
+      scale: z.number().int().min(1).max(4).default(2),
+    },
+    annotations: RO,
+  }, async ({ what, region, palette, bpp8, bank, scale }) => {
+    const r = await emu.readRegions();
+    const cgb = !!r.isCgbWram;
+    let img, desc;
+    if (what === 'palettes') {
+      img = palettesPng(emu.system === 'gba' ? gbaPalettes(r) : gbPalettes(r, { cgb }));
+      desc = emu.system === 'gba' ? 'GBA palettes: 16 BG rows then 16 OBJ rows of 16 colours' : (cgb ? 'CGB palettes: 8 BG then 8 OBJ' : 'DMG palettes: BGP, OBP0, OBP1');
+    } else if (emu.system === 'gba') {
+      img = gbaTilesPng(r, { region, palette, bpp8 });
+      desc = `GBA ${region} tiles (${bpp8 ? '8bpp' : `4bpp, palette ${palette}`}), 32 per row, tile 0 top-left`;
+    } else {
+      if (bank === 1 && r.vram.length < 0x4000) return errText('VRAM bank 1 only exists on GBC');
+      img = gbTilesPng(r, { bank, palette, cgb });
+      desc = `GB tiles 0x8000-0x97FF bank ${bank}, 16 per row (tile 0 = 0x8000)`;
+    }
+    return result(`${desc}, frame ${await emu.frameNum()}.`, undefined, [png(scalePng(img, scale))]);
+  });
+
+  // ---- Cheats ----
+  tool('set_cheats', {
+    title: 'Set cheat codes',
+    description: 'Replace the active cheat codes (an empty list clears them). GBA: GameShark, Action Replay or CodeBreaker codes (e.g. CodeBreaker 8-bit write "3AAAAAAA 00VV"). GB/GBC: GameShark "01VVLLHH" (writes VV to 0xHHLL; applied at VBlank like the real device) or Game Genie. Cheats apply every frame from the next one, and survive reset.',
+    inputSchema: { codes: z.array(z.string()).describe('Cheat codes, one per entry') },
+    outputSchema: { cheats: z.array(z.string()) },
+    annotations: ACT,
+  }, async ({ codes }) => {
+    await emu.setCheats(codes);
+    record({ cheats: codes });
+    return result(codes.length ? `${codes.length} cheat(s) active: ${codes.join(', ')}` : 'Cheats cleared.', { cheats: codes });
+  });
+
+  // ---- Battery saves ----
+  tool('export_save', {
+    title: 'Export battery save',
+    description: "Write the cartridge's battery save (the .sav: SRAM/flash/EEPROM) on the current frame to a file, so a test can check what the game saved or keep it as a fixture.",
+    inputSchema: { path: z.string().describe('Where to write the .sav') },
+    outputSchema: { path: z.string(), bytes: z.number() },
+    annotations: ACT,
+  }, async ({ path: p }) => {
+    const data = await emu.readSaveData();
+    if (!data) return errText('This game has no battery save.');
+    const file = await writePath(p);
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, data);
+    return result(`Wrote ${data.length}-byte save to ${file}.`, { path: file, bytes: data.length });
+  });
+
+  tool('import_save', {
+    title: 'Import battery save',
+    description: 'Load a .sav file into the cartridge and reset, so the game boots with that save (e.g. start a test from a 100% save). reset=false patches it in without resetting.',
+    inputSchema: { path: z.string(), reset: z.boolean().default(true) },
+    outputSchema: { bytes: z.number(), frame: z.number() },
+    annotations: { ...ACT, destructiveHint: true },
+  }, async ({ path: p, reset }) => {
+    const file = await resolvePath(p);
+    const data = await readFile(file);
+    await emu.writeSaveData(data, { reset });
+    record({ importSave: file, reset });
+    const frame = await emu.frameNum();
+    return result(`Imported ${data.length}-byte save from ${file}${reset ? '; game reset' : ''}. Frame ${frame}.`, { bytes: data.length, frame });
+  });
+
+  // ---- Recording ----
+  tool('export_script', {
+    title: 'Export session as a test script',
+    description: 'Turn everything done since load_rom (inputs, waits, wait_until results, states, RAM writes, cheats, saves, golden asserts, run_sequence steps) into a replayable step script — the same format run_sequence and runner.mjs take. Exploratory play becomes a regression test: add {"assert": ...} / {"assertRam": ...} steps where it matters. Replays are frame-exact.',
+    inputSchema: {
+      path: z.string().optional().describe('Also write the script (JSON) here'),
+      includeShots: z.boolean().default(false).describe('Keep a {"shot"} step for every screenshot you took'),
+    },
+    outputSchema: { rom: z.string(), steps: z.array(z.record(z.string(), z.any())) },
+    annotations: RO,
+  }, async ({ path: p, includeShots }) => {
+    const steps = rec.filter((s) => includeShots || !s.shot).map((s) => ({ ...s }));
+    // Merge consecutive waits.
+    const merged = [];
+    for (const s of steps) {
+      const last = merged[merged.length - 1];
+      if (last && 'wait' in s && 'wait' in last && Object.keys(s).length === 1 && Object.keys(last).length === 1) last.wait += s.wait;
+      else merged.push(s);
+    }
+    const script = { rom: romPath, steps: merged.filter((s) => !('wait' in s) || s.wait > 0) };
+    let file;
+    if (p) {
+      file = await writePath(p);
+      await mkdir(path.dirname(file), { recursive: true });
+      await writeFile(file, JSON.stringify(script, null, 2) + '\n');
+    }
+    return result(`${script.steps.length} steps${file ? ` written to ${file}` : ''}. Replay: load_rom + run_sequence(steps), or \`node runner.mjs <file>\`.\n${JSON.stringify(script, null, 1)}`, script);
+  });
+
+  // ---- A/B comparison ----
+  tool('ab_compare', {
+    title: 'Compare two ROM builds',
+    description: 'Run the same steps on two ROMs (e.g. the last good build and the new one) side by side in separate emulators and report, per screenshot step and RAM read, whether they differ — with A | B | diff images for the shots that do. Uses the run_sequence step format; put {"shot": "name"} / {"read": ...} steps where you want comparisons. Does not touch the currently loaded ROM.',
+    inputSchema: {
+      romA: z.string(), romB: z.string(),
+      steps: z.array(z.record(z.string(), z.any())).min(1),
+      tolerance: z.number().int().min(0).max(255).default(16),
+      scale: z.number().int().min(1).max(3).default(2),
+      maxImages: z.number().int().min(0).max(10).default(4),
+    },
+    outputSchema: {
+      identical: z.boolean(),
+      shots: z.array(z.object({ name: z.string(), frame: z.number(), fraction: z.number() })),
+      reads: z.array(z.object({ step: z.number(), a: z.any(), b: z.any(), same: z.boolean() })),
+    },
+    annotations: RO,
+  }, async ({ romA, romB, steps, tolerance, scale, maxImages }) => {
+    const [pa, pb] = [await resolvePath(romA), await resolvePath(romB)];
+    const base = await baseDir();
+    const runOne = async (rom) => {
+      const h = await EmuHarness.launch(rom, { reuse: true });
+      try { return { system: h.system, ...(await runSteps(h, steps, { baseDir: base, checkWrite: await writeGuard() })) }; } finally { await h.close(); }
+    };
+    const [A, B] = await Promise.all([runOne(pa), runOne(pb)]);
+    if (A.system !== B.system) return errText(`ROMs are for different consoles (${A.system} vs ${B.system}).`);
+    const shots = [], images = [];
+    A.shots.forEach((sa, i) => {
+      const sb = B.shots[i];
+      if (!sb) return;
+      const c = compare(sa.png, sb.png, { tolerance });
+      shots.push({ name: sa.name, frame: sa.frame, fraction: c.fraction });
+      if (c.fraction > 0 && images.length / 2 < maxImages) {
+        const tiles = [sa.png, sb.png, ...(c.diffPng ? [c.diffPng] : [])];
+        images.push({ type: 'text', text: `"${sa.name}" @ frame ${sa.frame}: A | B | diff (${(c.fraction * 100).toFixed(2)}% differ)` },
+          png(contactSheet(tiles, { cols: tiles.length, scale })));
+      }
+    });
+    const reads = [];
+    A.timeline.forEach((ea, i) => {
+      if (!('value' in ea)) return;
+      const eb = B.timeline[i];
+      reads.push({ step: i, a: ea.value, b: eb?.value, same: JSON.stringify(ea.value) === JSON.stringify(eb?.value) });
+    });
+    const identical = shots.every((s) => s.fraction === 0) && reads.every((r) => r.same);
+    const lines = [
+      ...shots.map((s) => `shot "${s.name}" f${s.frame}: ${s.fraction === 0 ? 'identical' : `${(s.fraction * 100).toFixed(2)}% differ`}`),
+      ...reads.map((r) => `step #${r.step} read: A=${JSON.stringify(r.a)} B=${JSON.stringify(r.b)}${r.same ? '' : '  <-- differs'}`),
+    ];
+    return result(`${identical ? 'IDENTICAL' : 'DIFFERENT'}: ${path.basename(pa)} vs ${path.basename(pb)}${A.failures + B.failures ? ` (failed asserts: A ${A.failures}, B ${B.failures})` : ''}\n${lines.join('\n') || '(no shot/read steps to compare)'}`,
+      { identical, shots, reads }, images);
+  }, { needsRom: false });
 
   // ---- RAM search ----
   const SearchOut = {
@@ -444,17 +705,17 @@ States saved here are shared with save_state/load_state.`,
 
   tool('reset', {
     title: 'Reset game',
-    description: 'Reset the current game (soft restart). Saved states are kept.',
+    description: 'Reset the game like the console\'s reset button: the battery save and cheats are kept, the frame clock restarts at 1. Deterministic. Saved states are kept.',
     inputSchema: {},
     annotations: { ...ACT, destructiveHint: true },
   }, async () => {
     await emu.restart();
-    await emu.waitFrames(1);
+    record({ reset: true });
     return result(`Game reset. Frame ${await emu.frameNum()}.`);
   });
 
   const statusData = async () => (emu
-    ? { loaded: true, rom: romPath, system: sysName(emu.system), frame: await emu.frameNum(), states: [...states.keys()], held: await emu.heldButtons(), ramSearch: search ? search.count : null }
+    ? { loaded: true, rom: romPath, system: sysName(emu.system), frame: await emu.frameNum(), states: [...states.keys()], held: await emu.heldButtons(), ramSearch: search ? search.count : null, cheats: emu.cheats, recordedSteps: rec.length }
     : { loaded: false, states: [] });
 
   tool('status', {
@@ -464,12 +725,13 @@ States saved here are shared with save_state/load_state.`,
     outputSchema: {
       loaded: z.boolean(), rom: z.string().optional(), system: z.string().optional(), frame: z.number().optional(),
       states: z.array(z.string()), held: z.array(z.string()).optional(), ramSearch: z.number().nullable().optional(),
+      cheats: z.array(z.string()).optional(), recordedSteps: z.number().optional(),
     },
     annotations: RO,
   }, async () => {
     const s = await statusData();
     if (!s.loaded) return result('No ROM loaded.', s);
-    return result(`ROM: ${romName} (${s.system}), frame ${s.frame}, held: ${s.held.join(', ') || 'none'}, ${s.states.length} saved state(s)${s.states.length ? ` [${s.states.join(', ')}]` : ''}${search ? `, RAM search: ${search.count} candidates` : ''}.`, s);
+    return result(`ROM: ${romName} (${s.system}), frame ${s.frame}, held: ${s.held.join(', ') || 'none'}, ${s.states.length} saved state(s)${s.states.length ? ` [${s.states.join(', ')}]` : ''}${search ? `, RAM search: ${search.count} candidates` : ''}${s.cheats.length ? `, ${s.cheats.length} cheat(s)` : ''}, ${s.recordedSteps} recorded step(s).`, s);
   }, { needsRom: false });
 
   // ---- Resources ----
@@ -484,7 +746,8 @@ States saved here are shared with save_state/load_state.`,
   }, serial(async (uri) => ({ contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify(await statusData()) }] })));
 
   // ---- Prompts: reusable workflows that orchestrate the tools above ----
-  const userMsg = (t) => ({ messages: [{ role: 'user', content: { type: 'text', text: t } }] });
+  /** @param {string} t */
+  const userMsg = (t) => ({ messages: [{ role: /** @type {const} */ ('user'), content: { type: /** @type {const} */ ('text'), text: t } }] });
 
   server.registerPrompt('smoke_test_rom', {
     title: 'Smoke-test a ROM',
@@ -541,6 +804,27 @@ If this is the first run, say that you created the baselines and ask me to confi
    screenshot — the game should reflect it. If not, try the next candidate.
 
 Report the confirmed address, type, and how you verified it.`));
+
+  server.registerPrompt('record_regression_test', {
+    title: 'Record a regression test',
+    description: 'Play to a point of interest, then turn the session into a replayable test script with checks.',
+    argsSchema: { rom: z.string().describe('Path to the ROM'), goal: z.string().describe('What to reach and check, e.g. "beat the first enemy and check the score goes up"'), path: z.string().optional().describe('Where to save the script (default tests/<name>.json)') },
+  }, ({ rom, goal, path: p }) => userMsg(
+`Record a regression test for "${rom}": ${goal}
+
+1. load_rom with rom="${rom}" (this starts a fresh recording).
+2. Play towards the goal with press / set_button / wait_frames. Prefer wait_until
+   over guessing wait lengths (e.g. wait_until screen "stable" after a transition,
+   or a RAM condition). Use screenshot to see where you are.
+3. At each point that matters, add a check: assert_golden for the picture (mask
+   clocks/timers with \`ignore\`), or note a RAM address/value for an assertRam step
+   (use ram_search_* to find addresses if needed).
+4. export_script${p ? ` with path="${p}"` : ''} — then add {"assertRam": ...} steps to the
+   exported steps where you noted values.
+5. Prove it replays: load_rom again and run_sequence with the exported steps; it
+   must pass.
+
+Report the script path, what it checks, and the replay result.`));
 
   return {
     server,

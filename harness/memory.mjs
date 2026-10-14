@@ -117,3 +117,51 @@ export const readU32 = (s, a) => readMemory(s, a, 4).readUInt32LE(0);
 export const readS8 = (s, a) => readMemory(s, a, 1).readInt8(0);
 export const readS16 = (s, a) => readMemory(s, a, 2).readInt16LE(0);
 export const readS32 = (s, a) => readMemory(s, a, 4).readInt32LE(0);
+
+// Offset of a region view inside the save-state buffer it was parsed from.
+const offsetIn = (state, view) => view.byteOffset - state.byteOffset;
+
+/** Save-state byte offsets of `length` bytes at a GBA bus address (for watching
+ *  them frame by frame without re-parsing). */
+export function stateOffsets(state, addr, length = 1) {
+  const r = parseState(state);
+  return Array.from({ length }, (_, i) => { const [buf, o] = locate(r, (addr + i) >>> 0); return offsetIn(state, buf) + o; });
+}
+
+/** [start, length] save-state ranges holding everything that determines the
+ *  picture: VRAM, palettes, OAM and the display registers. */
+export function videoRanges(state) {
+  const r = parseState(state);
+  return [r.vram, r.pram, r.oam, r.io.subarray(0, 0x60)].map((v) => [offsetIn(state, v), v.length]);
+}
+
+/** The cartridge's battery save (SRAM/flash/EEPROM image, i.e. the .sav file) as a
+ *  view into the state, or null if the game has none. Writing it patches the state. */
+export function saveData(state) {
+  const mem = memChunk(state);
+  const P = findStructSize(mem);
+  for (let p = P; p + 16 <= mem.length; p += 16) {
+    const tag = mem.readInt32LE(p), size = mem.readInt32LE(p + 4), o = Number(mem.readBigInt64LE(p + 8));
+    if (tag === 0) break;
+    if (tag === 2 /* EXTDATA_SAVEDATA */) return mem.subarray(o, o + size);
+  }
+  return null;
+}
+
+const MODES = { 0x10: 'usr', 0x11: 'fiq', 0x12: 'irq', 0x13: 'svc', 0x17: 'abt', 0x1b: 'und', 0x1f: 'sys' };
+
+/** ARM7 registers from the state (GBASerializedState.cpu). `pc` is r15 as the CPU
+ *  holds it, which runs ahead of the executing instruction by the prefetch (8 bytes
+ *  in ARM state, 4 in Thumb); `executing` subtracts that. */
+export function cpu(state) {
+  const mem = memChunk(state);
+  const r = Array.from({ length: 16 }, (_, i) => mem.readUInt32LE(0x20 + i * 4));
+  const cpsr = mem.readUInt32LE(0x60);
+  const thumb = !!(cpsr & 0x20);
+  return {
+    r: r.slice(0, 13), sp: r[13], lr: r[14], pc: r[15], executing: (r[15] - (thumb ? 4 : 8)) >>> 0,
+    cpsr, mode: MODES[cpsr & 0x1f] ?? 'unknown', thumb,
+    flags: { n: !!(cpsr >>> 31), z: !!(cpsr & 1 << 30), c: !!(cpsr & 1 << 29), v: !!(cpsr & 1 << 28) },
+    irqDisabled: !!(cpsr & 0x80),
+  };
+}

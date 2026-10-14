@@ -20,16 +20,29 @@ reported), and reads/writes **real RAM** out of save states — no core rebuild 
 
 ## Setup (once)
 
+**From npm** (no clone needed): point your MCP host at `npx -y gb-gbc-gba-test-mcp`
+(`command: "npx"`, `args: ["-y", "gb-gbc-gba-test-mcp"]`). The package bundles the
+emulator cores; its install downloads headless Chromium.
+
+**From this repo** (to hack on it):
+
 ```bash
 cd gb-gbc-gba-test-mcp/harness
 npm install          # installs deps + Chromium (postinstall)
+npm test             # full suite;  npm run typecheck  checks the JSDoc types
 ```
+
+> Publishing: the npm package is the **repo root** `package.json` (it ships `data/`
+> plus `harness/`); `harness/package.json` is the dev workspace. Keep their
+> `version` and `dependencies` in sync — `npm run package-test` checks that, packs
+> the tarball, installs it into an empty project and drives a ROM through its bin.
+> Then `npm publish` from the repo root.
 
 ## Use as an MCP server
 
 It runs over **stdio** (`npm run mcp`), so any MCP host launches it with
-`command: "node"` and the absolute path to `mcp-server.mjs`. Requires Node 18+; the
-first `npm install` downloads headless Chromium.
+`command: "node"` and the absolute path to `mcp-server.mjs` (or `npx`, above).
+Requires Node 20+; the first `npm install` downloads headless Chromium.
 
 **Relative paths** in tool calls (ROMs, goldens, state files, screenshot saves)
 resolve against, in order: the `GBTEST_ROOT` env var, the host's first workspace
@@ -41,6 +54,13 @@ resolved absolute path.
 | `GBTEST_ROOT` | Base directory for relative paths. |
 | `GBTEST_CHROMIUM` | Use this Chromium/Chrome binary instead of Playwright's download. |
 | `UPDATE_GOLDENS=1` | Re-create goldens instead of comparing. |
+| `GBTEST_ALLOW_ANY_PATH=1` | Allow writing files outside the workspace root (see below). |
+
+**Writes stay in the workspace.** Files the tools create (screenshot saves, state
+files, goldens and diffs, `run_sequence` output, exported scripts and saves) must
+resolve inside the workspace root or `harness/out/`; anything else is refused, so a
+confused or prompt-injected agent can't overwrite arbitrary files. ROMs and other
+inputs can be read from anywhere.
 
 > **Config key differs by host:** VS Code uses `"servers"`; Claude Desktop, Cursor,
 > Windsurf, and Antigravity use `"mcpServers"`. The inner server entry is identical.
@@ -103,8 +123,16 @@ Claude Code).
 | `save_state` / `load_state` | Named snapshots; optional `path` saves/loads a file that survives restarts. |
 | `assert_golden` | Compare to a golden PNG (created on first run). On failure returns **current, golden and diff images inline**. |
 | `run_sequence` | Run a whole script of steps in **one call** (waits, taps, holds, shots, recordings as a contact sheet, RAM reads/writes/asserts, golden asserts) and get the timeline + images back. |
+| `wait_until` | Run until a **RAM condition** (`address` + `op` + `value`, or `changed`) or a **screen condition** (`changed`, or `stable` for N frames) holds, stopping on the first frame it does. Replaces wait-read-check loops. |
 | `ram_search_start` / `ram_search_filter` / `ram_search_results` | Cheat-search: find where the game keeps a value (eq / changed / increased / decreased / delta …) in a few calls. |
-| `frame_number`, `reset`, `status` | Housekeeping. |
+| `read_cpu` | CPU registers (GBA ARM7 / GB SM83) — tell "hung in a loop" from "running". |
+| `read_sprites` | Decoded sprite table (position, size, tile, palette, flips) + a screenshot with sprite boxes — find the player/enemies without a RAM search. |
+| `view_vram` | Tile graphics or all palettes as an image. |
+| `set_cheats` | GameShark / Action Replay / CodeBreaker (GBA), GameShark / Game Genie (GB). |
+| `export_save` / `import_save` | Battery saves (`.sav`): check what the game saved, or boot from a save. |
+| `export_script` | Everything done since `load_rom` as a replayable step script — exploratory play becomes a regression test. |
+| `ab_compare` | Run the same steps on two ROM builds side by side and diff the shots and RAM reads. |
+| `frame_number`, `reset`, `status` | Housekeeping. `reset` is the console's reset button: deterministic, keeps the battery save. |
 
 Tools carry MCP annotations (`readOnlyHint` etc.) and structured output schemas.
 Calls are serialized, so a host issuing tools in parallel can't interleave them.
@@ -122,6 +150,16 @@ a multi-step job using the tools:
   `assert_golden` at checkpoints.
 - `find_ram_address` — discover the address of an in-game value (HP, score…) with
   the RAM search tools, then verify it with a write.
+- `record_regression_test` — play to a goal, add checks, `export_script`, and prove
+  the script replays.
+
+**Cheats on GB/GBC:** GameShark codes (`01VVLLHH` writes `VV` to `0xHHLL`) are
+applied when the VBlank interrupt is serviced, like the real device, so they work in
+games that use VBlank interrupts (nearly all do).
+
+**Not included: a CPU debugger** (breakpoints, watchpoints, single-step). The bundled
+cores don't expose one; it would need custom builds of mgba/gambatte. `read_cpu`,
+`wait_until` on RAM conditions and frame-exact pausing cover the common cases.
 
 ### Example: finding HP with RAM search
 
@@ -164,8 +202,8 @@ await emu.loadState(save);            // restore exactly
 await emu.close();
 ```
 
-`launch(rom)` accepts any path; ROMs outside this folder are copied into `out/` so
-the local static server can serve them.
+`launch(rom)` accepts any path; the ROM is served to the browser in place (nothing is
+copied).
 
 The machine is **paused between calls** and only runs inside `waitFrames` /
 `waitUntilFrame` / `tap`, so a screenshot, RAM read or write always lands on exactly
@@ -193,7 +231,11 @@ the frame `frameNum()` reports, no matter how long your script takes in between.
 | `hasMemoryAccess()` | `true` only if the core exports *live* RAM (not required for reads). |
 | `videoDimensions()` | `{ w, h }` — `240x160` (GBA) or `160x144` (GB/GBC). |
 | `stats()` | Fast-forward counters `{ ffWaits, recoveries, restoreRetries }`. |
-| `restart()` | Reset the game. |
+| `waitFor(cond, {maxFrames=600, precise=false})` | Run until `{address, as, op, value}` or `{screen: 'changed' \| 'stable', frames}` holds; stops on the first matching frame → `{ met, frame }`. |
+| `readCpu()` | CPU registers on the current frame. |
+| `readSaveData()` / `writeSaveData(buf, {reset=true})` | Battery save (`.sav`) out / in (in = then reset, so the game boots with it). |
+| `setCheats(codes)` | Replace the active cheat codes. |
+| `restart()` | Reset button: battery save and cheats kept, clock back to frame 1, deterministic. |
 | `close()` | Shut down the browser and static server. |
 
 ## Screenshot timelines (AI-friendly)
@@ -206,10 +248,13 @@ node runner.mjs tests/anguna.script.json          # -> out/anguna.script/*.png +
 
 Step types: `wait` (frames), `tap`/`press`/`release`/`hold` (a button or an array of
 buttons), `shot` (named screenshot), `record` (`{frames, every, prefix}` — periodic
-screenshots), `saveState`/`loadState` (named, in-memory), `read` / `write` /
-`assertRam` (RAM by address, e.g. `{"assertRam": "0x03000010", "as": "u16",
-"equals": 3}` or `min`/`max`), and `assert` (golden compare). The same steps drive
-the MCP `run_sequence` tool (`steps.mjs`). Example:
+screenshots), `saveState`/`loadState` (named, in-memory), `loadStateFile`,
+`read` / `write` / `assertRam` (RAM by address, e.g. `{"assertRam": "0x03000010",
+"as": "u16", "equals": 3}` or `min`/`max`), `waitUntil` (`{"waitUntil": {"screen":
+"stable", "frames": 30}}` or a RAM condition), `reset`, `cheats`, `importSave`, and
+`assert` (golden compare, with optional `ignore` rectangles). The same steps drive
+the MCP `run_sequence` tool and `ab_compare`, and are what `export_script` writes
+(`steps.mjs`). Example:
 
 ```json
 { "rom": "../mygame.gba", "steps": [
@@ -239,6 +284,8 @@ const res = await assertGolden(await emu.screenshot(), 'goldens/title.png', { th
 - First run (or `UPDATE_GOLDENS=1 node runner.mjs ...`) **creates/refreshes** goldens.
 - `threshold` is the max fraction of differing pixels (default 2%); `tolerance` is the
   per-channel value delta that counts as "different" (default 16, absorbs codec noise).
+- `ignore: [{x, y, w, h}]` masks rectangles that legitimately change (clocks, timers);
+  they show dark blue in the diff image.
 - In `runner.mjs` scripts, `rom` is relative to the working directory and `assert`
   paths to the **script file's** directory.
 
@@ -275,6 +322,20 @@ known picture: the screenshot is then flagged stale (`lastScreenshotStale`, or a
 note in the MCP result) until you advance one frame. Goldens are also tied to this
 software (SwiftShader) renderer; regenerate them with `UPDATE_GOLDENS=1` after a
 Chromium/Playwright upgrade.
+
+**Resets.** `restart()` / `reset` presses the console's reset button: the core
+applies it before running its next frame, so the harness stops exactly one frame
+later and puts the clock at frame 1 (and the wait clock at 0, as after boot). Work
+RAM, battery save and cheats survive, like on hardware. `tests/features.mjs` checks
+that a reset game replays bit-identically to a freshly booted one.
+
+**Waiting on conditions.** `waitFor` / `wait_until` reads the watched bytes (or a
+hash of video memory) out of the machine state every frame it sees. In fast mode it
+fast-forwards; when the condition first shows up it rewinds to the last frame where
+it didn't hold and replays at 1×, so it still stops on the first matching frame
+(`tests/features.mjs` checks it against a precise frame-by-frame scan). A condition
+that becomes true and false again within one fast-forward step (a few frames) can
+be missed — `precise: true` checks every frame. `stable` always runs at 1×.
 
 ## Reading RAM (GBA and GB/GBC)
 

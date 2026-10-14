@@ -260,7 +260,96 @@
       await restore(b64ToU8(b64), Emu.frameNum());
       Emu._fbValid = false;
     };
-    Emu.restart = () => { gm().restart(); Emu._fbValid = false; Emu._screen = null; };
+    // Reset (like the console's reset button; cartridge RAM is kept). The core
+    // applies a queued reset before running its next frame, so after exactly one
+    // counted frame the machine is "reset + 1 frame": put the clock at 1 and the
+    // wait target back to 0, as after a fresh boot.
+    Emu.reset = async () => {
+      setFF(false);
+      Emu.pause();
+      gm().restart();
+      const c = gm().getFrameNum();
+      Emu.resume();
+      while (gm().getFrameNum() <= c) await raf();
+      Emu.pause();
+      Emu._offset = gm().getFrameNum() - 1;
+      Emu._target = 0;
+      Emu._advanced();
+    };
+
+    // ---- Cheats (GameShark / Action Replay / CodeBreaker / Game Genie) ----
+    Emu.setCheats = (codes) => {
+      gm().resetCheat();
+      codes.forEach((c, i) => gm().setCheat(i, 1, c));
+    };
+
+    // ---- Wait for a condition on the machine state ----
+    // spec.kind 'value': bytes at state offsets `offsets` (little-endian, width =
+    //   offsets.length, `signed`) compared with op eq/ne/gt/lt/gte/lte to `value`,
+    //   or 'changed' (differs from the value when the wait started).
+    // spec.kind 'video': `ranges` ([start, len] in the state) hashed; mode 'changed'
+    //   = differs from the start, 'stable' = unchanged for `frames` frames.
+    // Fast mode checks while fast-forwarding; once the condition holds it rewinds to
+    // the last frame where it did not and replays at 1x, so the reported frame is
+    // the first one where it holds. (A condition that turns true and false again
+    // between two fast-forward checks — a few frames — can be missed; precise:true
+    // checks every frame at 1x.) 'stable' always runs at 1x.
+    // -> { met, frame }  (paused on the first matching frame, or at the limit)
+    Emu.waitFor = async (spec, maxFrames, precise = false) => {
+      const fnv = (u8) => {
+        let h = 0x811c9dc5;
+        for (const [a, n] of spec.ranges) for (let i = a; i < a + n; i++) h = Math.imul(h ^ u8[i], 16777619);
+        return h >>> 0;
+      };
+      const val = (u8) => {
+        let v = 0;
+        for (let i = spec.offsets.length - 1; i >= 0; i--) v = v * 256 + u8[spec.offsets[i]];
+        const bits = spec.offsets.length * 8;
+        if (spec.signed && v >= 2 ** (bits - 1)) v -= 2 ** bits;
+        return v;
+      };
+      const measure = (u8) => (spec.kind === 'video' ? fnv(u8) : val(u8));
+      const start = measure(gm().getState());
+      const cmp = {
+        eq: (v) => v === spec.value, ne: (v) => v !== spec.value, gt: (v) => v > spec.value,
+        lt: (v) => v < spec.value, gte: (v) => v >= spec.value, lte: (v) => v <= spec.value,
+        changed: (v) => v !== start,
+      };
+      const stable = spec.kind === 'video' && spec.mode === 'stable';
+      const test = spec.kind === 'video' ? cmp.changed : cmp[spec.op];
+      const limit = Emu.frameNum() + maxFrames;
+      const t0 = performance.now(), timeoutMs = 30000 + maxFrames * (1000 / 60) * 2;
+      let last = start, lastChange = Emu.frameNum();
+      let lastFalse = null, lastFalseFrame = 0;
+      let fast = Emu.fast && !precise && !stable;
+      const done = (met) => { setFF(false); Emu.pause(); Emu._target = Emu.frameNum(); Emu._advanced(); return { met, frame: Emu.frameNum() }; };
+      Emu.resume();
+      for (;;) {
+        const f = Emu.frameNum();
+        const u8 = gm().getState();
+        const m = measure(u8);
+        if (stable) {
+          if (m !== last) { last = m; lastChange = f; }
+          if (f - lastChange >= spec.frames) return done(true);
+        } else if (test(m)) {
+          if (ffOn && lastFalse && f > lastFalseFrame + 1) {
+            // Fast-forward skipped frames: rewind and find the first match at 1x.
+            await restore(lastFalse, lastFalseFrame);
+            fast = false; lastFalse = null;
+            Emu.resume();
+            continue;
+          }
+          return done(true);
+        } else {
+          lastFalse = u8; lastFalseFrame = f;
+        }
+        if (f >= limit) return done(false);
+        if (performance.now() - t0 > timeoutMs) { done(false); throw new Error(`waitFor timeout at frame ${f}`); }
+        setFF(fast && limit - f > FF_MARGIN);
+        await raf();
+      }
+    };
+
 
     // Live system RAM, IF the loaded core exports the libretro memory API.
     // The bundled mgba core does NOT (returns null); a core rebuilt with

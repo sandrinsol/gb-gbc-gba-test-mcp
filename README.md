@@ -8,9 +8,15 @@ Two ways to use it:
 - **Play in a browser** — see below.
 - **Let an AI test your GBA/GB/GBC games** — the [`harness/`](harness/) folder is an
   **MCP server** (+ Node library) that drives this same emulator headlessly: load a
-  ROM, press buttons, capture screenshots the agent can *see*, read and write real RAM (GBA + GB/GBC), and
-  assert against golden frames. No third-party emulator. See
+  ROM, press buttons, capture screenshots the agent can *see*, read, write and search
+  real RAM, wait for game conditions, inspect sprites/tiles/CPU, use cheats and battery
+  saves, record a session as a replayable test, and assert against golden frames. No
+  third-party emulator. See
   [harness/README.md](harness/README.md).
+
+**Quick start:** add an MCP server with `command: "npx"`, `args: ["-y",
+"gb-gbc-gba-test-mcp"]` to your host (once the package is published to npm), or
+run it from this repo as below.
 
 **Use it in your editor** — VS Code (Copilot agent mode), Antigravity, Cursor,
 Windsurf, Claude Desktop/Code, or any MCP host. Setup for each is in
