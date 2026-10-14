@@ -17,8 +17,9 @@ paused between tool calls: the same inputs always give the same frames and RAM.
    Every tool call resends the conversation, so batching is the biggest saving.
 3. Wait for the game, don't guess: `wait_until` (or a `waitUntil` step) on a RAM
    value or on the screen changing / settling, instead of long `wait_frames`.
-4. Look only when needed: `screenshot` is 2× by default; prefer one `shot` at the end
-   of a sequence over a screenshot after every input.
+4. Look only when needed: `describe` gives the screen as text (on-screen text,
+   sprites, watched values) for far fewer tokens than a `screenshot`; prefer one
+   `shot` at the end of a sequence over a screenshot after every input.
 5. Check what matters:
    - picture: `assert_golden` (first run creates the golden; mask clocks with `ignore`;
      `sprite: N` compares one sprite instead of the whole screen),
@@ -33,7 +34,10 @@ paused between tool calls: the same inputs always give the same frames and RAM.
 
 - Buttons: `A B L R START SELECT UP DOWN LEFT RIGHT`. 60 frames ≈ 1 second.
 - Addresses: GBA `0x02000000` EWRAM, `0x03000000` IWRAM; GB `0xC000` WRAM,
-  `0xFF80` HRAM, `0xA000` cart RAM. Pass them as hex strings.
+  `0xFF80` HRAM, `0xA000` cart RAM. Pass them as hex strings, or as names when the
+  ROM has a symbol file (`.sym`/`.noi`/`.elf` beside it).
+- `watch` a few variables and every step reports them; `check` looks for crashes,
+  lag and sprite overflow.
 - Hung game? `read_cpu` twice a few frames apart: a `pc` that doesn't move means a loop.
 - Sprites on screen: `read_sprites` (also flags per-line hardware limits).
 - Save states (`save_state` / `load_state`) are the fastest way to retry from a point.

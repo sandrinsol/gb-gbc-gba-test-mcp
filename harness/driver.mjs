@@ -25,6 +25,7 @@ import * as gbaMem from './memory.mjs';
 import * as gbMem from './gb-memory.mjs';
 import { gbaSprites, gbSprites } from './video.mjs';
 import { renderSprite } from './sprite.mjs';
+import { findSymbols, loadSymbols, parseAddress } from './symbols.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..'); // the repo root (served to the browser)
@@ -124,6 +125,8 @@ async function startHost({ headless = true } = {}) {
 export class EmuHarness {
   constructor({ host, shared, context, page, romToken, system, blocked }) {
     this._state = null;      // cached raw state of the current frame (see _rawState)
+    /** @type {import("./symbols.mjs").Symbols | null} */
+    this.symbols = null; this.symbolsError = null;
     this.cheats = [];
     this.host = host; this._shared = shared;
     this.browser = host.browser; this.server = host.server;
@@ -136,8 +139,12 @@ export class EmuHarness {
   /** Boot a ROM. Options:
    *  - fast (default true): fast-forward long waits (results stay bit-identical).
    *  - reuse (default false): share one browser + server across harnesses; close()
-   *    then only closes this page. Call EmuHarness.shutdown() when done. */
-  static async launch(romPath, { headless = true, timeout = 60000, fast = true, reuse = false } = {}) {
+   *    then only closes this page. Call EmuHarness.shutdown() when done.
+   *  - symbols (default true): a symbol file (.sym/.noi/.elf/.map) path, true to
+   *    look for one next to the ROM, or false. Addresses can then be names.
+   *  @param {string} romPath
+   *  @param {{ headless?: boolean, timeout?: number, fast?: boolean, reuse?: boolean, symbols?: boolean | string | null }} [opts] */
+  static async launch(romPath, { headless = true, timeout = 60000, fast = true, reuse = false, symbols = true } = {}) {
     const absRom = path.resolve(process.cwd(), romPath);
     await stat(absRom).catch(() => { throw new Error(`ROM not found: ${absRom}`); });
 
@@ -194,7 +201,9 @@ export class EmuHarness {
     // Hold the machine still between calls (it only runs inside waits).
     // Hold the machine still between calls (it only runs inside waits).
     const system = await page.evaluate(() => { window.Emu.pause(); window.Emu.initAudio(); return window.Emu.system; });
-    return new EmuHarness({ host, shared: reuse, context, page, romToken, system, blocked });
+    const emu = new EmuHarness({ host, shared: reuse, context, page, romToken, system, blocked });
+    await emu.useSymbols(symbols === true ? await findSymbols(absRom) : symbols || null);
+    return emu;
   }
 
   /** Close the shared browser + server used by `reuse: true` harnesses. */
@@ -202,6 +211,18 @@ export class EmuHarness {
     const h = sharedHost; sharedHost = null;
     if (h) await h.close();
   }
+
+  /** Load a symbol file (null clears). A file that fails to parse is reported in
+   *  `symbolsError` instead of throwing. */
+  async useSymbols(file) {
+    this.symbols = null; this.symbolsError = null;
+    if (!file) return null;
+    try { this.symbols = await loadSymbols(path.resolve(file)); } catch (e) { this.symbolsError = e.message; }
+    return this.symbols;
+  }
+
+  /** An address as a number: numbers, hex strings, or symbol names. */
+  addr(a) { return parseAddress(a, this.symbols); }
 
   frameNum() { return this.page.evaluate(() => window.Emu.frameNum()); }
   videoDimensions() { return this.page.evaluate(() => window.Emu.videoDimensions()); }
@@ -253,10 +274,12 @@ export class EmuHarness {
     if (!this._state) this._state = Buffer.from(await this.page.evaluate(() => window.Emu.rawState()), 'base64');
     return this._state;
   }
-  async loadState(buf) {
+  /** Restore a state. The frame number keeps counting on, unless `frame` gives
+   *  the number to continue from (e.g. the one the state was saved at). */
+  async loadState(buf, { frame = undefined } = {}) {
     this._state = null;
     const b64 = Buffer.from(buf).toString('base64');
-    await this.page.evaluate((b) => window.Emu.loadState(b), b64);
+    await this.page.evaluate(([b, f]) => window.Emu.loadState(b, f), [b64, frame]);
   }
 
   /** Whether the loaded core exposes live RAM exports (bundled mgba core does not;
@@ -276,7 +299,7 @@ export class EmuHarness {
   /** Read `length` bytes at a bus address. GBA e.g. 0x03000000 (IWRAM); GB/GBC e.g.
    *  0xC000 (WRAM), 0xFF80 (HRAM). Reflects the current frame. Addresses are
    *  interpreted for whichever console the loaded ROM is. */
-  async readMemory(addr, length = 1) { return this._mem.readMemory(await this._rawState(), addr, length); }
+  async readMemory(addr, length = 1) { return this._mem.readMemory(await this._rawState(), this.addr(addr), length); }
   async readU8(addr) { return (await this.readMemory(addr, 1)).readUInt8(0); }
   async readU16(addr) { return (await this.readMemory(addr, 2)).readUInt16LE(0); }
   async readU32(addr) { return (await this.readMemory(addr, 4)).readUInt32LE(0); }
@@ -286,6 +309,7 @@ export class EmuHarness {
    *  whether the bytes read back as written — false if the address isn't RAM-backed
    *  in the state. The game may still overwrite the value on the next frame. */
   async writeMemory(addr, data) {
+    addr = this.addr(addr);
     const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
     const state = Buffer.from(await this._rawState());
     this._mem.writeMemory(state, addr, bytes);
@@ -417,7 +441,7 @@ export class EmuHarness {
       const op = cond.op ?? 'eq';
       if (!['eq', 'ne', 'gt', 'lt', 'gte', 'lte', 'changed'].includes(op)) throw new Error(`bad op ${op}`);
       if (op !== 'changed' && typeof cond.value !== 'number') throw new Error(`op ${op} needs a numeric value`);
-      spec = { kind: 'value', offsets: this._mem.stateOffsets(state, cond.address, width), signed: as.startsWith('s'), op, value: cond.value };
+      spec = { kind: 'value', offsets: this._mem.stateOffsets(state, this.addr(cond.address), width), signed: as.startsWith('s'), op, value: cond.value };
     }
     this._state = null;
     return this.page.evaluate(([sp, m, p]) => window.Emu.waitFor(sp, m, p), [spec, maxFrames, precise]);

@@ -5,8 +5,11 @@ agent test them through an MCP server. Everything runs offline from the bundled
 `data/` folder (EmulatorJS with the mgba and gambatte cores).
 
 - **Play:** see below.
-- **Test with an AI agent:** see [harness/README.md](harness/README.md). In Claude
-  Code: `/plugin install gb-gbc-gba-test --marketplace sandrinsol/gb-gbc-gba-test-mcp`.
+- **Make or test games with an AI agent:** see [harness/README.md](harness/README.md).
+  In Claude Code: `/plugin install gb-gbc-gba-test --marketplace sandrinsol/gb-gbc-gba-test-mcp`.
+  The agent can build your game, read its variables by name and its screen as text,
+  check it against hardware rules, convert art, and start new games from
+  [templates](templates/) for RGBDS, GBDK-2020 and GBA C.
 
 ## Play
 

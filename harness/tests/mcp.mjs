@@ -51,14 +51,15 @@ try {
   const names = tools.map((t) => t.name);
   const ALL = ['load_rom', 'wait_frames', 'press', 'set_button', 'wait_until', 'reset', 'screenshot', 'read_memory',
     'read_cpu', 'read_sprites', 'view_vram', 'status', 'write_memory', 'save_state', 'load_state', 'set_cheats',
-    'battery_save', 'run_sequence', 'assert_golden', 'export_script', 'ab_compare', 'ram_search', 'record_video', 'sprite'];
+    'battery_save', 'run_sequence', 'assert_golden', 'export_script', 'ab_compare', 'ram_search', 'record_video', 'sprite',
+    'background', 'build', 'new_project', 'watch', 'describe', 'check'];
   for (const n of ALL) ok(`tool listed: ${n}`, names.includes(n));
   ok('exactly the documented tools', names.length === ALL.length, `${names.length}`);
   ok('screenshot is annotated read-only', tools.find((t) => t.name === 'screenshot').annotations?.readOnlyHint === true);
   const listJson = JSON.stringify(tools);
   ok('tool list is slim (no output schemas, $schema or ±2^53 bounds)',
     !tools.some((t) => t.outputSchema) && !listJson.includes('$schema') && !listJson.includes('9007199254740991'));
-  ok('tool list stays small', listJson.length / 4 < 3000, `~${Math.round(listJson.length / 4)} tokens`);
+  ok('tool list stays small', listJson.length / 4 < 3400, `~${Math.round(listJson.length / 4)} tokens`);
   const { prompts } = await client.listPrompts();
   ok('prompts listed', ['smoke_test_rom', 'regression_check', 'find_ram_address', 'record_regression_test'].every((p) => prompts.some((x) => x.name === p)));
   const { resources } = await client.listResources();
@@ -327,7 +328,7 @@ try {
 }
 
 // --- GBTEST_TOOLS subsets ---
-for (const [spec, expect] of /** @type {Array<[string, number]>} */ ([['core', 11], ['core,ram_search', 12], ['screenshot,status', 2]])) {
+for (const [spec, expect] of /** @type {Array<[string, number]>} */ ([['core', 13], ['core,ram_search', 14], ['screenshot,status', 2]])) {
   const sub = createServer({ tools: spec });
   const c = new Client({ name: 'test', version: '0' });
   const [a, b] = InMemoryTransport.createLinkedPair();
