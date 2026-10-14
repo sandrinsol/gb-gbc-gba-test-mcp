@@ -12,7 +12,9 @@ import { randomBytes } from 'node:crypto';
 import { createServer } from '../mcp-server.mjs';
 import { EmuHarness } from '../driver.mjs';
 import { decodePng } from '../png.mjs';
-import { decodeIo, formatDisplay, renderLayers, gbaDisplayIssues, gbaSaveType } from '../gba.mjs';
+import { decodeIo, formatDisplay, formatSound, renderLayers, gbaDisplayIssues, gbaSaveType, dmaPurpose, vramBudget } from '../gba.mjs';
+import { decodeWav, convertSound, encodeWav8, makeTable, writeSound, writeTable, timerFor } from '../gamedata.mjs';
+import { loadSymbols } from '../symbols.mjs';
 import { lz77Compress, lz77Decompress } from '../lz77.mjs';
 import { encodeIndexedBmp } from '../bmp.mjs';
 import { convertSprite, writeSpriteSource } from '../sprite.mjs';
@@ -144,6 +146,95 @@ try {
   await a.waitFrames(30); await b.waitFrames(30);
   ok('BIOS LZ77UnCompVram rebuilds the exact font tiles', (await a.readMemory(0x06000400, 3072)).equals(await b.readMemory(0x06000400, 3072)));
   await a.close(); await b.close();
+}
+
+// ---- Sound, memory budget, CPU load, data tool ----
+/** A 16-bit stereo WAV of a sine tone. */
+const toneWav = (freq, rate = 44100, seconds = 1, { bits = 16, channels = 2 } = {}) => {
+  const n = rate * seconds, bps = bits / 8, b = Buffer.alloc(44 + n * bps * channels);
+  b.write('RIFF', 0, 'latin1'); b.writeUInt32LE(b.length - 8, 4); b.write('WAVEfmt ', 8, 'latin1');
+  b.writeUInt32LE(16, 16); b.writeUInt16LE(1, 20); b.writeUInt16LE(channels, 22); b.writeUInt32LE(rate, 24);
+  b.writeUInt32LE(rate * bps * channels, 28); b.writeUInt16LE(bps * channels, 32); b.writeUInt16LE(bits, 34);
+  b.write('data', 36, 'latin1'); b.writeUInt32LE(n * bps * channels, 40);
+  for (let i = 0; i < n; i++) for (let c = 0; c < channels; c++) {
+    const v = Math.sin(2 * Math.PI * freq * i / rate) * 0.6, o = 44 + (i * channels + c) * bps;
+    if (bits === 16) b.writeInt16LE(Math.round(v * 32767), o); else b[o] = Math.round(v * 127 + 128);
+  }
+  return b;
+};
+{
+  const w16 = decodeWav(toneWav(440)), w8 = decodeWav(toneWav(440, 22050, 1, { bits: 8, channels: 1 }));
+  ok('WAV decode: 16-bit stereo and 8-bit mono', w16.rate === 44100 && w16.channels === 2 && w16.samples.length === 44100 && w8.channels === 1 && Math.abs(Math.max(...w8.samples) - 0.6) < 0.02);
+  ok('timer reload for 18157 Hz is 64612 (304 samples per frame)', timerFor(18157).reload === 64612 && Math.round(280896 / (16777216 / timerFor(18157).rate)) === 304);
+  const c = convertSound(toneWav(440), { rate: 18157 });
+  ok('sound conversion: length, rate, padding, no clipping', Math.abs(c.length - 18157) <= 1 && c.pcm.length % 16 === 0 && c.clipped === 0 && Math.abs(c.peak - 0.6) < 0.01);
+  const files = await writeSound(c, path.join(OUT, 'tone.c'), 'tone');
+  const h = await readFile(files[1], 'utf8');
+  ok('sound .c/.h with rate and timer reload', h.includes('#define TONE_TIMER_RELOAD 64612') && h.includes('#define TONE_LENGTH'));
+  const w = decodeWav(encodeWav8(c.pcm, c.length, c.rate));
+  ok('sound .wav (8-bit, for Maxmod/Butano) round-trips', w.rate === 18157 && w.samples.length === c.length);
+  const sin = makeTable('sin', { size: 512, bits: 12 }), cos = makeTable('cos'), rec = makeTable('reciprocal', { size: 256, bits: 16 });
+  ok('sin/cos tables in .12 fixed point', sin.values[128] === 4096 && sin.values[0] === 0 && cos.values[0] === 4096 && sin.type === 'short');
+  ok('reciprocal table', rec.values[3] === Math.round(65536 / 3) && rec.values[0] === 0 && rec.type === 'unsigned int');
+  const tf = await writeTable(sin, path.join(OUT, 'sin.h'), 'sin_lut');
+  ok('table header', (await readFile(tf[0], 'utf8')).includes('static const short sin_lut[512]'));
+  ok('DMA purpose: FIFO, scroll and mode 7 per line', /FIFO A/.test(dmaPurpose({ dst: 0x040000a0, timing: 'special' })) && /BG0HOFS.*scroll/.test(dmaPurpose({ dst: 0x04000010, timing: 'hblank' })) && /BG2PA.*mode 7/.test(dmaPurpose({ dst: 0x04000020, timing: 'hblank' })) && dmaPurpose({ dst: 0x06000000, timing: 'now' }) === null);
+  const syms = await loadSymbols(path.join(FIX, 'templates', 'gba-c', 'hello.elf'));
+  ok('symbol names prefer variables over linker markers', syms.nameOf(syms.resolve('frame_counter')) === 'frame_counter');
+
+  // tone.gba: the gba-c starter playing a 440 Hz tone converted by convertSound,
+  // through DirectSound A (timer 0 + DMA1).
+  const e = await EmuHarness.launch(path.join(FIX, 'sound', 'tone.gba'), { reuse: true, fast: false });
+  await e.waitFrames(10);
+  const d = decodeIo((await e.readRegions()).io);
+  ok('sound decode: DirectSound A at 18157 Hz fed by DMA1', formatSound(d).join('\n').includes('DirectSound A 100% L+R · timer 0 18157 Hz · fed by DMA1'), formatSound(d).join(' | '));
+  await e.startRecording({ every: 1, maxFrames: 60 });
+  await e.waitFrames(40);
+  const a = /** @type {any} */ (await e.stopRecording()).audio;
+  const n = a.pcm.length / 2 / a.channels, x = new Float64Array(n);
+  for (let i = 0; i < n; i++) x[i] = a.pcm.readInt16LE(i * 2 * a.channels);
+  const ac = (lag) => { let sum = 0; for (let i = 0; i + lag < n; i++) sum += x[i] * x[i + lag]; return sum; };
+  let bestLag = 0, best = -Infinity;
+  for (let lag = Math.floor(a.rate / 600); lag <= Math.ceil(a.rate / 300); lag++) { const v = ac(lag); if (v > best) { best = v; bestLag = lag; } }
+  const freq = a.rate / bestLag;
+  ok('the converted tone plays at its pitch (440 Hz ± 3%)', Math.abs(freq - 440) < 13, `${freq.toFixed(1)} Hz`);
+  await e.close();
+}
+{
+  const e = await EmuHarness.launch(GBA_C, { reuse: true });
+  await e.waitFrames(30);
+  const b = vramBudget(await e.readRegions());
+  ok('memory budget: player tiles, one palette bank each', b.objUsed === 4 && b.objPal === 1 && b.bgPal === 1 && b.bgBytes > 0, b.lines[0]);
+  await e.close();
+}
+{
+  const { server, close } = createServer({ root: OUT });
+  const client = new Client({ name: 'test', version: '0' });
+  const [ct, st] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(st), client.connect(ct)]);
+  /** @returns {Promise<any>} */
+  const call = (name, args = {}) => client.callTool({ name, arguments: args });
+  const textOf = (r) => r.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n');
+  try {
+    await import('node:fs/promises').then((fs) => fs.writeFile(path.join(OUT, 'beep.wav'), toneWav(880, 32000, 0.25)));
+    let r = await call('data', { kind: 'sound', wav: 'beep.wav', out: 'snd/beep.c' });
+    ok('data sound tool', !r.isError && /at 18157\.2 Hz \(timer reload 64612\)/.test(textOf(r)), textOf(r));
+    r = await call('data', { kind: 'table', table: 'sin', out: 'lut/sin.c' });
+    ok('data table tool', !r.isError && /512 short entries, 12 fractional bits/.test(textOf(r)), textOf(r));
+    await call('load_rom', { rom: path.join(FIX, 'sound', 'tone.gba') });
+    await call('wait_frames', { frames: 10 });
+    r = await call('describe', { io: true });
+    ok('describe io: sound and memory lines', /sound: master on · DirectSound A/.test(textOf(r)) && /memory: BG VRAM .* OBJ tiles 4\/1024/.test(textOf(r)), textOf(r));
+    r = await call('check', { frames: 20 });
+    ok('check: CPU load from cpu_usage and no sound problems', /ok: CPU \d+-\d+% of a frame/.test(textOf(r)) && !/ERROR/.test(textOf(r)), textOf(r));
+    await call('write_memory', { address: '0x04000102', value: 0, as: 'u16' });   // stop timer 0
+    await call('write_memory', { address: '0x04000084', value: 0, as: 'u16' });   // master off
+    r = await call('check', { frames: 5 });
+    ok('check: stopped sample timer and master switch off', /ERROR: DMA1 feeds DirectSound FIFO A but the sound master switch is off/.test(textOf(r)) && /ERROR: DirectSound A is clocked by timer 0, which is stopped/.test(textOf(r)), textOf(r));
+  } finally {
+    await client.close();
+    await close();
+  }
 }
 
 ok('templates include the GBA starters', ['gba-c', 'gba-tonc', 'gba-butano'].every((t) => TEMPLATES[t]));

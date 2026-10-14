@@ -6,11 +6,11 @@
 // third-party emulator program. Tools, in groups:
 //   play     load_rom, wait_frames, press, set_button, wait_until, reset
 //   look     screenshot, read_memory, read_cpu, read_sprites, view_vram, status
-//   change   write_memory, save_state, load_state, set_cheats, battery_save
+//   change   write_memory, state (save/load), cartridge (cheats, battery save)
 //   test     run_sequence, assert_golden, export_script, ab_compare, record_video
 //   find     ram_search
 //   make     sprite (convert art, inject into the game, overlay, export), background
-//   develop  build (compile + reload), describe (screen as text), watch, check
+//   develop  build (compile + reload), describe (screen as text + watch list), check
 // Addresses can be symbol names when the ROM has a symbol file (.sym/.noi/.elf/.map).
 // A gbtest.json in the workspace sets project defaults (build, rom, charmap, watch).
 // The machine is paused between calls, so every read lands on an exact frame.
@@ -38,12 +38,13 @@ import { convertSprite, writeSpriteSource, injectSprite, overlayFrame, framePng,
 import { RamSearch, SEARCH_OPS, SEARCH_TYPES } from './ramsearch.mjs';
 import { runSteps, decodeValues, encodeValue, VALUE_TYPES } from './steps.mjs';
 import { gbaSprites, gbSprites, drawBoxes, gbaPalettes, gbPalettes, palettesPng, gbaTilesPng, gbTilesPng, gbIoLines } from './video.mjs';
-import { decodeIo, formatDisplay, formatSystem, renderLayers, gbaSaveType } from './gba.mjs';
+import { decodeIo, formatDisplay, formatSystem, formatSound, vramBudget, renderLayers, gbaSaveType } from './gba.mjs';
 import { screenText, learnCharmap, normalizeCharmap } from './screentext.mjs';
 import { romHeaderIssues, RunChecker } from './checks.mjs';
 import { runCommand, parseDiagnostics, formatDiagnostic, detectBuild, findRom, readProjectConfig } from './build.mjs';
 import { convertBackground, writeBackgroundSource, renderTiledMap, BG_TARGETS } from './background.mjs';
 import { TEMPLATES, createProject } from './templates.mjs';
+import { convertSound, writeSound, makeTable, writeTable } from './gamedata.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = path.join(__dirname, 'out');
@@ -453,26 +454,22 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     return result(`Wrote ${bytes.length}B at ${label(addr)} but it did not stick (not RAM, or overwritten); now: ${hexBytes(await emu.readMemory(addr, bytes.length))}.`, { stuck });
   });
 
-  tool('save_state', {
-    description: 'Snapshot under `id`; `path` also writes a file.',
-    inputSchema: { id: z.string().default('default'), path: z.string().optional() },
-  }, async ({ id, path: p }) => {
-    const st = await emu.saveState();
-    states.set(id, st);
-    record({ saveState: id });
-    let file;
-    if (p) {
-      file = await writePath(p);
-      await mkdir(path.dirname(file), { recursive: true });
-      await writeFile(file, st);
+  tool('state', {
+    description: 'Save state `id` (and to `path`), or load it (or a state file).',
+    inputSchema: { action: z.enum(['save', 'load']), id: z.string().default('default'), path: z.string().optional() },
+  }, async ({ action, id, path: p }) => {
+    if (action === 'save') {
+      const st = await emu.saveState();
+      states.set(id, st);
+      record({ saveState: id });
+      let file;
+      if (p) {
+        file = await writePath(p);
+        await mkdir(path.dirname(file), { recursive: true });
+        await writeFile(file, st);
+      }
+      return result(`Saved "${id}" at frame ${await emu.frameNum()}${file ? ` to ${file}` : ''}.`);
     }
-    return result(`Saved "${id}" at frame ${await emu.frameNum()}${file ? ` to ${file}` : ''}.`);
-  });
-
-  tool('load_state', {
-    description: 'Restore state `id`, or a state file (`path`).',
-    inputSchema: { id: z.string().default('default'), path: z.string().optional() },
-  }, async ({ id, path: p }) => {
     let st;
     if (p) {
       st = await readFile(await resolvePath(p));
@@ -486,20 +483,21 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     return result(`Restored. Frame ${frame}.${await watchLine()}`, { frame });
   });
 
-  tool('set_cheats', {
-    description: 'Replace cheat codes ([] clears). GBA: GameShark/Action Replay/CodeBreaker. GB: GameShark 01VVLLHH (applied at VBlank) or Game Genie.',
-    inputSchema: { codes: z.array(z.string()) },
-  }, async ({ codes }) => {
-    await emu.setCheats(codes);
-    record({ cheats: codes });
-    return result(codes.length ? `${codes.length} cheat(s) active.` : 'Cheats cleared.');
-  });
-
-  tool('battery_save', {
-    description: 'Battery save (.sav): export to `path`, or import from it and reset so the game boots with it.',
-    inputSchema: { action: z.enum(['export', 'import']), path: z.string(), reset: z.boolean().default(true) },
-  }, async ({ action, path: p, reset }) => {
-    if (action === 'export') {
+  tool('cartridge', {
+    description: 'cheats: replace codes ([] clears; GBA GameShark/AR/CodeBreaker, GB GameShark 01VVLLHH or Game Genie). export_save / import_save: the battery .sav at `path` (import resets unless reset:false).',
+    inputSchema: {
+      action: z.enum(['cheats', 'export_save', 'import_save']),
+      codes: z.array(z.string()).optional(), path: z.string().optional(), reset: z.boolean().default(true),
+    },
+  }, async ({ action, codes, path: p, reset }) => {
+    if (action === 'cheats') {
+      if (!codes) return errText('cheats needs `codes`');
+      await emu.setCheats(codes);
+      record({ cheats: codes });
+      return result(codes.length ? `${codes.length} cheat(s) active.` : 'Cheats cleared.');
+    }
+    if (!p) return errText(`${action} needs \`path\``);
+    if (action === 'export_save') {
       const data = await emu.readSaveData();
       if (!data) return errText('This game has no battery save.');
       const file = await writePath(p);
@@ -803,6 +801,30 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     return result(text, { tiles: conv.tileCount, palettes: conv.palettes.length }, [png(scalePng(conv.previewPng, sc))]);
   }, { needsRom: false });
 
+  // ---- Make: other data ----
+  tool('data', {
+    description: 'Game data. sound: WAV → GBA DirectSound signed 8-bit PCM (.c/.h/.s/.bin, with timer reload) or a resampled 8-bit .wav for Maxmod/Butano audio/. table: sin/cos/reciprocal lookup in fixed point (.c/.h/.s).',
+    inputSchema: {
+      kind: z.enum(['sound', 'table']),
+      out: z.string(), name: z.string().optional(),
+      wav: z.string().optional(), rate: z.number().int().min(4000).max(65536).default(18157), normalize: z.boolean().default(false),
+      table: z.enum(['sin', 'cos', 'reciprocal']).optional(), size: z.number().int().min(2).max(65536).default(512), bits: z.number().int().min(0).max(24).default(12),
+    },
+  }, async (a) => {
+    const file = await writePath(a.out);
+    const name = a.name ?? path.basename(a.out).replace(/\.[^.]+$/, '');
+    if (a.kind === 'sound') {
+      if (!a.wav) return errText('sound needs `wav`');
+      const c = convertSound(await readFile(await resolvePath(a.wav)), { rate: a.rate, normalize: a.normalize });
+      const files = await writeSound(c, file, name);
+      return result(`${c.length} samples, ${c.seconds.toFixed(2)} s (${c.frames} frames) at ${c.rate.toFixed(1)} Hz (timer reload ${c.reload}) from ${c.sourceRate} Hz ${c.channels === 1 ? 'mono' : `${c.channels}-ch`}; peak ${(c.peak * 100).toFixed(0)}%${c.clipped ? `, ${c.clipped} samples clipped` : ''}. Wrote ${files.join(', ')}.`, { samples: c.length });
+    }
+    if (!a.table) return errText('table needs `table` (sin, cos or reciprocal)');
+    const t = makeTable(a.table, { size: a.size, bits: a.bits });
+    const files = await writeTable(t, file, name);
+    return result(`${a.table} table: ${t.size} ${t.type} entries, ${t.bits} fractional bits. Wrote ${files.join(', ')}.`, { size: t.size });
+  }, { needsRom: false });
+
   // ---- Develop ----
   tool('build', {
     description: 'Build (gbtest.json build, else make): errors as file:line, then load the ROM + symbols and check its header. replay: redo the steps since the last load.',
@@ -855,18 +877,10 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     return result(`Created ${dest} (${files.length} files): ${files.join(', ')}. Set the workspace to it (or GBTEST_ROOT), then build.`);
   }, { needsRom: false });
 
-  tool('watch', {
-    description: 'Variables reported after each step that advances time: "name", "name:u16", "0xC000:s8". Replaces the list.',
-    inputSchema: { vars: z.array(z.string()) },
-  }, async ({ vars }) => {
-    watches = vars.map(parseWatch);
-    const v = await watchValues();
-    return result(v.length ? `watch: ${v.join(' ')}` : 'Watch list cleared.');
-  });
-
   tool('describe', {
-    description: 'Screen as text, far cheaper than a screenshot: on-screen text, sprites, watch values, % changed since last time.',
+    description: 'Screen as text, far cheaper than a screenshot: on-screen text, sprites, watched values, % changed since last time. watch sets the variables reported after every step that advances time ("name", "name:u16", "0xC000:s8"; [] clears).',
     inputSchema: {
+      watch: z.array(z.string()).optional(),
       charmap: z.any().optional().describe('"ascii" or {first: tile of chars[0], chars}'),
       learn: z.string().optional().describe('text you can see; infers the charmap'),
       io: z.boolean().default(false).describe('registers in words'),
@@ -880,6 +894,7 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
     const lines = [];
     const pc = emu.system === 'gba' ? cpu.executing ?? cpu.pc : cpu.pc;
     const at = emu.symbols?.nameOf(pc, { bank: cpu.romBank });
+    if (a.watch) watches = a.watch.map(parseWatch);
     lines.push(`Frame ${await emu.frameNum()}, ${emu.system === 'gba' ? 'GBA' : r.isCgbWram ? 'GBC' : 'GB'}, pc ${hex(pc)}${at ? ` (${at})` : ''}.`);
     const wv = await watchValues();
     if (wv.length) lines.push(`watch: ${wv.join(' ')}`);
@@ -904,17 +919,16 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
       lines.push(`screen: ${c.fraction === 0 ? 'unchanged' : `${(c.fraction * 100).toFixed(1)}% changed`} since the last describe`);
     }
     lastDescribe = shot;
-    if (a.io) lines.push(...(emu.system === 'gba' ? (() => { const d = decodeIo(r.io); return [...formatDisplay(d), ...formatSystem(d)]; })() : gbIoLines(r, cpu)));
+    if (a.io) lines.push(...(emu.system === 'gba' ? (() => { const d = decodeIo(r.io); return [...formatDisplay(d), ...formatSystem(d), ...formatSound(d), ...vramBudget(r).lines]; })() : gbIoLines(r, cpu)));
     return result(lines.join('\n'), undefined, a.image ? [png(scalePng(shot, a.scale))] : []);
   });
 
   tool('check', {
-    description: 'Hardware rules: ROM header, then `frames` frames watching for crashes, bad stack, sprite overflow, bitmap-mode sprite tiles, blank screen, lag. State restored after.',
+    description: 'Hardware rules: ROM header, then `frames` frames watching for crashes, bad stack, sprite/memory limits, display and sound set-up mistakes, blank screen, lag and CPU load (cpu_usage variable). State restored after.',
     inputSchema: {
       frames: z.number().int().min(1).max(3600).default(120),
       frameCounter: Address.optional().describe('per-frame counter (default gbtest.json or *frame_count*)'),
     },
-    annotations: RO,
   }, async ({ frames, frameCounter }) => {
     const found = [];
     if (!/\.zip$/i.test(romPath)) found.push(...romHeaderIssues(await readFile(romPath), emu.system));
@@ -931,12 +945,24 @@ export function createServer({ root = undefined, fast = true, tools = undefined 
         if (sym?.size) width = Math.min(sym.size, 4) === 3 ? 2 : Math.min(sym.size, 4);
       } catch (e) { counterNote = ` (frame counter: ${e.message})`; }
     }
-    const checker = new RunChecker(emu.system, { frameCounter: counterAddr, counterWidth: width });
+    // The game's own CPU-usage variable (% of a frame), if it has one.
+    let cpuAddr = null, cpuWidth = emu.system === 'gba' ? 4 : 1;
+    const cpuName = cfg.cpuUsage ?? [...(emu.symbols?.byName.values() ?? [])].find((x) => /^_?(cpu_usage|cpu_load|cpuUsage)$/.test(x.name))?.name;
+    if (cpuName) {
+      try {
+        cpuAddr = emu.addr(cpuName);
+        const sym = typeof cpuName === 'string' ? emu.symbols?.get(cpuName) : null;
+        if (sym?.size) cpuWidth = Math.min(sym.size, 4) === 3 ? 2 : Math.min(sym.size, 4);
+      } catch { cpuAddr = null; }
+    }
+    const checker = new RunChecker(emu.system, { frameCounter: counterAddr, counterWidth: width, cpuUsage: cpuAddr });
     const saved = await emu.saveState(), f0 = await emu.frameNum();
     try {
       for (let i = 0; i < frames; i++) {
         await emu.waitFrames(1);
-        checker.observe(await emu.readRegions(), await emu.readCpu(), counterAddr !== null ? await emu.readMemory(counterAddr, width) : null);
+        let cpuPct = null;
+        if (cpuAddr !== null) { const b = await emu.readMemory(cpuAddr, cpuWidth); cpuPct = cpuWidth === 1 ? b.readInt8(0) : cpuWidth === 2 ? b.readInt16LE(0) : b.readInt32LE(0); }
+        checker.observe(await emu.readRegions(), await emu.readCpu(), counterAddr !== null ? await emu.readMemory(counterAddr, width) : null, cpuPct);
       }
     } finally { await emu.loadState(saved, { frame: f0 }); }
     found.push(...checker.findings());
@@ -1019,7 +1045,7 @@ Sequence to perform: ${steps}
    checkpoint. Advance time only with wait steps (never real-time sleeps) so the run
    is deterministic. The FIRST run creates the baselines; later runs compare.
 3. Report each checkpoint PASS/FAIL with the percent differing. On FAIL, call
-   assert_golden at that point (replay with load_state/run_sequence if needed) to see
+   assert_golden at that point (replay with state load/run_sequence if needed) to see
    the current/golden/diff images, and describe what changed.
 
 If this is the first run, say that you created the baselines and ask me to confirm they look correct.`));
@@ -1032,7 +1058,7 @@ If this is the first run, say that you created the baselines and ask me to confi
 `Find the RAM address of "${variable}" in "${rom}" using the RAM search tools.
 
 1. load_rom, then play (press / run_sequence) to a point where "${variable}" is in play.
-   save_state id="start" so you can retry.
+   state action="save" id="start" so you can retry.
 2. ram_search action="start"${region ? ` region="${region}"` : ''}. If you can read the value on screen, pass it as
    \`value\` (try type "u8" first; "u16" for values above 255).
 3. Change the value in game (take damage, collect a coin…), then ram_search

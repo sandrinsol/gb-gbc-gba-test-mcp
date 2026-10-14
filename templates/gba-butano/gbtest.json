@@ -1,6 +1,10 @@
 {
   "build": "make -j4",
   "rom": "hello.gba",
-  "watch": ["player_x:s32", "player_y:s32"],
-  "frameCounter": "frame_counter"
+  "watch": [
+    "player_x:s32",
+    "player_y:s32"
+  ],
+  "frameCounter": "frame_counter",
+  "cpuUsage": "cpu_usage"
 }

@@ -70,7 +70,7 @@ int main() {
 
 ## Testing with the harness
 
-- Put state the tests need in globals (`volatile int lives;`) so `watch`,
+- Put state the tests need in globals (`volatile int lives;`) so the watch list,
   `assertRam` and `read_memory` find them by name in the `.elf`.
 - Butano text is sprites: `describe` lists them but can't read them; take a
   screenshot, or keep the text you need to check in a global too.

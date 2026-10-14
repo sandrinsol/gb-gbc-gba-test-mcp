@@ -36,12 +36,12 @@ paused between tool calls: the same inputs always give the same frames and RAM.
 - Addresses: GBA `0x02000000` EWRAM, `0x03000000` IWRAM; GB `0xC000` WRAM,
   `0xFF80` HRAM, `0xA000` cart RAM. Pass them as hex strings, or as names when the
   ROM has a symbol file (`.sym`/`.noi`/`.elf` beside it).
-- `watch` a few variables and every step reports them; `check` looks for crashes,
+- `describe` with `watch: [...]` picks variables that every step then reports; `check` looks for crashes,
   lag and sprite overflow.
 - Hung game? `read_cpu` twice a few frames apart: a `pc` that doesn't move means a loop.
 - Sprites on screen: `read_sprites` (also flags per-line hardware limits).
-- Save states (`save_state` / `load_state`) are the fastest way to retry from a point.
-- Battery saves: `battery_save` `import` boots the game from a `.sav`; `export` checks
+- Save states (`state` `save` / `load`) are the fastest way to retry from a point.
+- Battery saves: `cartridge` `import_save` boots the game from a `.sav`; `export_save` checks
   what it saved.
 - For a person: `record_video` (.gif plays everywhere, .mp4 has sound), or
   `run_sequence` with `video: {path}` to keep a clip only when a check fails.

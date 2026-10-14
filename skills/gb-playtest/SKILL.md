@@ -15,12 +15,13 @@ developer can replay.
 2. Learn the screen cheaply: `describe`. If it says the font is unknown, find a word
    on screen in a `screenshot` and pass it as `describe` `learn`. From then on,
    `describe` reads menus and dialogue as text: use it instead of screenshots.
-3. Watch what matters for the goal (`watch`: lives, HP, score, position, level).
+3. Watch what matters for the goal (`describe` with `watch`: lives, HP, score,
+   position, level).
    Without symbols, find the addresses with `ram_search` first.
 
 ## Play
 
-- Save a state at every checkpoint (`save_state` id per place: "level1-start",
+- Save a state at every checkpoint (`state` `save` with an id per place: "level1-start",
   "boss-door"); retry from there instead of from boot.
 - Move in `run_sequence` batches: `hold` to walk, `tap` to act, `waitUntil` on the
   screen settling or a RAM value, then one `describe`.

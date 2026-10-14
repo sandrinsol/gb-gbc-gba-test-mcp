@@ -17,7 +17,10 @@ export class Symbols {
     /** @type {Map<string, Sym>} */
     this.byName = new Map();
     for (const s of list) if (!this.byName.has(s.name)) this.byName.set(s.name, s);
-    this.sorted = [...this.byName.values()].sort((a, b) => a.addr - b.addr);
+    // At equal addresses the last one wins in nameOf: put real variables and
+    // functions (sized, no leading underscores) after linker markers like __bss_start.
+    const rank = (s) => (s.size ? 2 : 0) + (/^__|^\.|_(start|end)__?$/i.test(s.name) ? 0 : 1);
+    this.sorted = [...this.byName.values()].sort((a, b) => a.addr - b.addr || rank(a) - rank(b));
   }
 
   get count() { return this.byName.size; }

@@ -14,7 +14,7 @@ diff or the changed files to know what to attack, but judge the game by running 
 2. `check` for 120+ frames at boot and again near the changed feature.
 3. Exercise the change: the intended use, then the edges — limits, repeated input,
    input on the exact frame something happens, pausing, transitions, save/load.
-   Use `describe` to read the screen and `watch` for the variables involved.
+   Use `describe` to read the screen and its `watch` list for the variables involved.
 4. For every check you make, keep it as a test: a `tests/gb/<feature>.json` script
    (`export_script`, then add `assertRam` / `assert` steps) that passes on correct
    behaviour. Replay it with `run_sequence` to prove it does.

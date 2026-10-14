@@ -50,16 +50,16 @@ try {
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name);
   const ALL = ['load_rom', 'wait_frames', 'press', 'set_button', 'wait_until', 'reset', 'screenshot', 'read_memory',
-    'read_cpu', 'read_sprites', 'view_vram', 'status', 'write_memory', 'save_state', 'load_state', 'set_cheats',
-    'battery_save', 'run_sequence', 'assert_golden', 'export_script', 'ab_compare', 'ram_search', 'record_video', 'sprite',
-    'background', 'build', 'new_project', 'watch', 'describe', 'check'];
+    'read_cpu', 'read_sprites', 'view_vram', 'status', 'write_memory', 'state', 'cartridge',
+    'run_sequence', 'assert_golden', 'export_script', 'ab_compare', 'ram_search', 'record_video', 'sprite',
+    'background', 'build', 'new_project', 'describe', 'check', 'data'];
   for (const n of ALL) ok(`tool listed: ${n}`, names.includes(n));
   ok('exactly the documented tools', names.length === ALL.length, `${names.length}`);
   ok('screenshot is annotated read-only', tools.find((t) => t.name === 'screenshot').annotations?.readOnlyHint === true);
   const listJson = JSON.stringify(tools);
   ok('tool list is slim (no output schemas, $schema or ±2^53 bounds)',
     !tools.some((t) => t.outputSchema) && !listJson.includes('$schema') && !listJson.includes('9007199254740991'));
-  ok('tool list stays small', listJson.length / 4 < 3400, `~${Math.round(listJson.length / 4)} tokens`);
+  ok('tool list stays small', listJson.length / 4 < 3600, `~${Math.round(listJson.length / 4)} tokens`);
   const { prompts } = await client.listPrompts();
   ok('prompts listed', ['smoke_test_rom', 'regression_check', 'find_ram_address', 'record_regression_test'].every((p) => prompts.some((x) => x.name === p)));
   const { resources } = await client.listResources();
@@ -98,12 +98,12 @@ try {
   ok('write visible to read_memory', r.structuredContent.values[0] === 0xbeef);
 
   // --- States on disk ---
-  r = await call('save_state', { id: 'cp', path: 'harness/out/mcp-test/cp.state' });
+  r = await call('state', { action: 'save', id: 'cp', path: 'harness/out/mcp-test/cp.state' });
   ok('save_state to file', !r.isError && existsSync(path.join(OUT, 'cp.state')), textOf(r));
   const shotAtCp = (await call('screenshot', { scale: 1 })).content[1].data;
   await call('press', { buttons: ['START', 'A'], hold: 6, release: 30 });
-  await call('save_state', {});
-  r = await call('load_state', { path: 'harness/out/mcp-test/cp.state' });
+  await call('state', { action: 'save' });
+  r = await call('state', { action: 'load', path: 'harness/out/mcp-test/cp.state' });
   ok('load_state from file', !r.isError, textOf(r));
   ok('loading a file keeps the named "default" state', (await call('status')).structuredContent.states.includes('default'));
   ok('state restore is pixel-exact', (await call('screenshot', { scale: 1 })).content[1].data === shotAtCp);
@@ -136,7 +136,7 @@ try {
   ok('run_sequence returns shot + contact sheet', images(r).length === 2, `${images(r).length} images`);
   ok('run_sequence reports read values', /read poked = 48879/.test(textOf(r)), textOf(r));
   ok('run_sequence writes timeline.json', existsSync(path.join(OUT, 'seq', 'timeline.json')));
-  r = await call('load_state', { id: 'seq' });
+  r = await call('state', { action: 'load', id: 'seq' });
   ok('run_sequence states shared with load_state', !r.isError);
   r = await call('run_sequence', { steps: [{ assertRam: '0x02000100', as: 'u16', equals: 1 }] });
   ok('run_sequence failed assertRam -> isError', r.isError && r.structuredContent.failures === 1);
@@ -206,11 +206,11 @@ try {
   ok('view_vram GBA obj tiles 256x256 @2x', images(r)[0]?.width === 512 && images(r)[0]?.height === 512);
   r = await call('view_vram', { what: 'palettes' });
   ok('view_vram palettes', !r.isError && images(r).length === 1);
-  r = await call('set_cheats', { codes: ['32000100 0042'] });
+  r = await call('cartridge', { action: 'cheats', codes: ['32000100 0042'] });
   await call('wait_frames', { frames: 2 });
   r = await call('read_memory', { address: '0x02000100', length: 1, as: 'u8' });
   ok('GBA CodeBreaker cheat applies', r.structuredContent.values[0] === 0x42, textOf(r));
-  await call('set_cheats', { codes: [] });
+  await call('cartridge', { action: 'cheats', codes: [] });
   r = await call('reset');
   ok('reset restarts the clock at frame 1', /Frame 1\./.test(textOf(r)), textOf(r));
 
@@ -238,7 +238,7 @@ try {
   // --- A state file from a fresh session: picture unknown -> flagged stale ---
   await call('load_rom', { rom: 'anguna.gba' });
   await call('wait_frames', { frames: 10 });
-  r = await call('load_state', { path: 'harness/out/mcp-test/cp.state' });
+  r = await call('state', { action: 'load', path: 'harness/out/mcp-test/cp.state' });
   r = await call('screenshot', { scale: 1 });
   ok('screenshot after external state load is flagged stale', r.structuredContent.stale === true && /wait_frames 1/.test(textOf(r)));
   await call('wait_frames', { frames: 1 });
@@ -285,7 +285,7 @@ try {
   ok('read_sprites (GB) finds the poked sprite', r.structuredContent.onScreen === 1 && /\n#0 72,64 8x8 t1 p0$/.test(textOf(r)), textOf(r));
   r = await call('view_vram');
   ok('view_vram GB tiles 128x192 @2x', images(r)[0]?.width === 256 && images(r)[0]?.height === 384);
-  r = await call('battery_save', { action: 'export', path: 'harness/out/mcp-test/none.sav' });
+  r = await call('cartridge', { action: 'export_save', path: 'harness/out/mcp-test/none.sav' });
   ok('battery_save export errors when the game has no battery', r.isError && /no battery save/.test(textOf(r)));
 
   // --- Battery saves ---
@@ -293,11 +293,11 @@ try {
   await call('wait_frames', { frames: 10 });
   const sav = Buffer.alloc(8192); sav[0] = 0x42;
   await writeFile(path.join(OUT, 'in.sav'), sav);
-  r = await call('battery_save', { action: 'import', path: 'harness/out/mcp-test/in.sav' });
+  r = await call('cartridge', { action: 'import_save', path: 'harness/out/mcp-test/in.sav' });
   ok('battery_save import resets the game', !r.isError && r.structuredContent.frame === 1, textOf(r));
   r = await call('read_memory', { address: '0xC000', length: 1, as: 'u8' });
   ok('game booted with the imported save', r.structuredContent.values[0] === 0x42, textOf(r));
-  r = await call('battery_save', { action: 'export', path: 'harness/out/mcp-test/out.sav' });
+  r = await call('cartridge', { action: 'export_save', path: 'harness/out/mcp-test/out.sav' });
   const outSav = await readFile(path.join(OUT, 'out.sav'));
   ok('battery_save export has what the game wrote', !r.isError && outSav.length === 8192 && outSav[1] === 0x43, `A001=${outSav[1]}`);
   r = await call('reset');
@@ -307,7 +307,7 @@ try {
   // --- GB GameShark (applied at VBlank) ---
   await call('load_rom', { rom: vblankRom });
   await call('wait_frames', { frames: 10 });
-  await call('set_cheats', { codes: ['01AAD0C0'] });
+  await call('cartridge', { action: 'cheats', codes: ['01AAD0C0'] });
   await call('wait_frames', { frames: 3 });
   r = await call('read_memory', { address: '0xC0D0', length: 1, as: 'u8' });
   ok('GB GameShark cheat applies', r.structuredContent.values[0] === 0xaa, textOf(r));

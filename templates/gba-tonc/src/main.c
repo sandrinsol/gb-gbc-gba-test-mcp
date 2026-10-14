@@ -1,13 +1,14 @@
 // GBA starter with libtonc: text on background 0 (tonc's text engine), a 16x16
 // player sprite moved with the D-pad, VBlank interrupt + VBlankIntrWait.
 //
-// player_x, player_y and frame_counter are globals so tests can read them by
-// name (volatile: the game loop writes them to RAM every frame).
+// player_x, player_y, frame_counter and cpu_usage are globals so tests can read
+// them by name (volatile: the game loop writes them to RAM every frame).
 #include <tonc.h>
 #include "player.h"
 
 volatile int player_x = 112, player_y = 64;
 volatile u32 frame_counter;
+volatile int cpu_usage;  // % of the last frame spent on game logic
 
 OBJ_ATTR obj_buffer[128];
 
@@ -38,5 +39,8 @@ int main(void) {
         obj_set_pos(player, player_x, player_y);
         oam_copy(oam_mem, obj_buffer, 1);
         frame_counter++;
+        // Lines drawn since VBlank started (line 160) = CPU time used; 228 lines
+        // per frame. x * 449 >> 10 ≈ x * 100 / 228 without a division.
+        cpu_usage = (((REG_VCOUNT + 228 - 160) % 228) * 449) >> 10;
     }
 }

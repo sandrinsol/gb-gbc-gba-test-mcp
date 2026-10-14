@@ -23,8 +23,9 @@ also read the `butano` skill.
 2. Each frame: `VBlankIntrWait()` → copy the shadow OAM (and any queued VRAM/palette
    updates) → read input → update the game → draw into the shadow OAM.
 3. Keep VBlank work short (~1.2 ms of the 16.7 ms frame); do game logic after it.
-4. Count frames in a global (`frame_counter`) and name it in `gbtest.json`: `check`
-   then reports lag (frames where the loop didn't finish in time).
+4. Count frames in a global (`frame_counter`) and measure CPU load in another
+   (`cpu_usage`, % of a frame; the starters show how). Name them in `gbtest.json`
+   (`frameCounter`, `cpuUsage`): `check` then reports lag and CPU load.
 
 ## Rules that matter on hardware
 
@@ -53,7 +54,12 @@ also read the `butano` skill.
 | Sprite missing | `read_sprites`, `view_vram` `layers` | Hidden bit, off-screen Y wrap, zero affine matrix, bitmap mode with tiles < 512 |
 | Slowdown | `check` with a frame counter | Logic over a frame: divisions, ROM-heavy loops, too much per-frame copying |
 | Freezes | `read_cpu`, `describe` `io: true` | Waiting for an interrupt that's disabled (IME/IE/DISPSTAT bit) |
-| Saves lost | `check`, `battery_save` | No save-type string; 16-bit writes to SRAM |
+| Saves lost | `check`, `cartridge` `export_save` | No save-type string; 16-bit writes to SRAM |
+| No sound | `describe` `io: true`, `check` | Master switch off, timer stopped, DMA not feeding the FIFO, channel not routed L/R |
+| Sprites fail to load | `describe` `io: true` (memory line), `check` | Sprite tile memory or palette banks full |
 
 Art: `sprite` and `background` convert PNGs (and Tiled maps) with `compress: "lz77"`
-for the BIOS decompressor, and write `.bmp` + `.json` for Butano.
+for the BIOS decompressor, and write `.bmp` + `.json` for Butano. Sound effects and
+lookup tables: the `data` tool. Speed: the `gba-performance` skill; differences from
+a real console: `gba-real-hardware`. Review code before running it: the
+`gba-reviewer` agent.

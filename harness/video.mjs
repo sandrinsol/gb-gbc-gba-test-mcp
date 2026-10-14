@@ -178,6 +178,9 @@ export function gbIoLines(regions, cpu) {
     `palettes (colour 0-3 → shade): BGP ${pal(io[0x47])} OBP0 ${pal(io[0x48])} OBP1 ${pal(io[0x49])}`,
     `interrupts: IME ${cpu.ime ? 'on' : 'OFF'} · enabled ${irqs(regions.hram?.[0x1ff] ?? 0)} · pending ${irqs(io[0x0f])}${cpu.halted ? ' · CPU halted' : ''}`,
   ];
+  const nr52 = io[0x26], nr51 = io[0x25], nr50 = io[0x24];
+  const routed = [1, 2, 3, 4].filter((c) => nr51 & (0x11 << (c - 1)));
+  lines.push(nr52 & 0x80 ? `sound: on · volume L ${(nr50 >> 4) & 7}/7 R ${nr50 & 7}/7 · routed: ${routed.length ? routed.map((c) => `ch${c}`).join(', ') : 'none'}` : 'sound: OFF (NR52 bit 7): silent');
   if (regions.isCgbWram) lines.push(`GBC: ${io[0x4d] & 0x80 ? 'double' : 'normal'} speed · VRAM bank ${io[0x4f] & 1} · WRAM bank ${io[0x70] & 7 || 1}`);
   return lines;
 }

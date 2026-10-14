@@ -1,7 +1,7 @@
 // GBA starter with Butano: text, and a 16x16 player sprite moved with the D-pad.
 //
-// player_x, player_y and frame_counter are globals so tests can read them by
-// name (volatile: written to RAM every frame, whatever the optimiser does).
+// player_x, player_y, frame_counter and cpu_usage are globals so tests can read
+// them by name (volatile: written to RAM every frame, whatever the optimiser does).
 // Butano's coordinates are centred: (0, 0) is the middle of the screen.
 #include "bn_core.h"
 #include "bn_keypad.h"
@@ -16,6 +16,7 @@
 
 volatile int player_x = 0, player_y = 0;
 volatile unsigned frame_counter = 0;
+volatile int cpu_usage = 0;  // % of the last frame Butano spent busy
 
 int main()
 {
@@ -39,5 +40,6 @@ int main()
         player.set_position(player_x, player_y);
         frame_counter = frame_counter + 1;
         bn::core::update();
+        cpu_usage = (bn::core::last_cpu_usage() * 100).right_shift_integer();
     }
 }
