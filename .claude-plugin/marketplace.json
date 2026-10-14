@@ -1,0 +1,14 @@
+{
+  "name": "gb-gbc-gba-test",
+  "owner": {
+    "name": "sandrinsol"
+  },
+  "description": "Game Boy / Color / Advance testing and development tools for Claude Code.",
+  "plugins": [
+    {
+      "name": "gb-gbc-gba-test",
+      "source": "./",
+      "description": "Play, test and debug Game Boy / Color / Advance ROMs from Claude Code."
+    }
+  ]
+}

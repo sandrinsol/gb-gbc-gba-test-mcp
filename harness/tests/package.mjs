@@ -6,6 +6,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -23,6 +24,12 @@ const root = JSON.parse(await readFile(path.join(REPO, 'package.json'), 'utf8'))
 const dev = JSON.parse(await readFile(path.join(REPO, 'harness', 'package.json'), 'utf8'));
 ok('versions match', root.version === dev.version, `${root.version} / ${dev.version}`);
 ok('dependencies match', JSON.stringify(root.dependencies) === JSON.stringify(dev.dependencies));
+// The Claude Code plugin manifest starts the server through launch.mjs.
+const plugin = JSON.parse(await readFile(path.join(REPO, '.claude-plugin', 'plugin.json'), 'utf8'));
+const launch = plugin.mcpServers?.['gb-gbc-gba-test']?.args?.[0]?.replace('${CLAUDE_PLUGIN_ROOT}', REPO);
+ok('plugin version matches', plugin.version === root.version, `${plugin.version} / ${root.version}`);
+ok('plugin starts an existing launcher', !!launch && existsSync(launch), launch);
+ok('plugin skills exist', ['gb-game-testing', 'gb-homebrew-dev', 'gb-ci-tests'].every((n) => existsSync(path.join(REPO, 'skills', n, 'SKILL.md'))));
 
 const work = await mkdtemp(path.join(tmpdir(), 'gbtest-pkg-'));
 try {

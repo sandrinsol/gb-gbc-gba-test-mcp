@@ -846,11 +846,13 @@ Report the script path, what it checks, and the replay result.`));
 }
 
 // ---- Entry point (stdio) ----
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
-if (isMain) {
+/** Serve over stdio until stdin closes. */
+export async function main() {
   const { server, close } = createServer();
   for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, async () => { await close(); process.exit(0); });
   process.stdin.on('close', async () => { await close(); process.exit(0); });
   await server.connect(new StdioServerTransport());
   console.error(`gb-gbc-gba-test-mcp ${VERSION} ready (stdio).`);
 }
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+if (isMain) await main();

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "gb-gbc-gba-test",
+  "version": "1.3.0",
+  "description": "Play, test and debug Game Boy / Color / Advance ROMs from Claude Code: an MCP server around a bundled emulator plus skills for testing, homebrew development and CI.",
+  "author": { "name": "sandrinsol" },
+  "repository": "https://github.com/sandrinsol/gb-gbc-gba-test-mcp",
+  "license": "GPL-3.0-or-later",
+  "keywords": ["gameboy", "gba", "gbc", "emulator", "testing", "homebrew", "mcp"],
+  "mcpServers": {
+    "gb-gbc-gba-test": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/harness/launch.mjs"]
+    }
+  }
+}

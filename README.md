@@ -5,7 +5,8 @@ agent test them through an MCP server. Everything runs offline from the bundled
 `data/` folder (EmulatorJS with the mgba and gambatte cores).
 
 - **Play:** see below.
-- **Test with an AI agent:** see [harness/README.md](harness/README.md).
+- **Test with an AI agent:** see [harness/README.md](harness/README.md). In Claude
+  Code: `/plugin install gb-gbc-gba-test --marketplace sandrinsol/gb-gbc-gba-test-mcp`.
 
 ## Play
 
