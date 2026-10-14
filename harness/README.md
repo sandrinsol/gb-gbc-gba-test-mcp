@@ -18,6 +18,13 @@ Everything is **deterministic** (verified bit-identical across runs), **fast**
 paused between calls), **fully offline** (any external request is blocked and
 reported), and reads/writes **real RAM** out of save states — no core rebuild needed.
 
+**Contents:** [Setup](#setup-once) · [Use as an MCP server](#use-as-an-mcp-server) ·
+[Tools & prompts](#tools--prompts) · [Writing a test](#writing-a-test) · [API](#api) ·
+[Screenshot timelines](#screenshot-timelines-ai-friendly) ·
+[Golden-frame diffing](#golden-frame-diffing) · [How it works](#how-it-works) ·
+[Determinism](#determinism-verified) · [Reading RAM](#reading-ram-gba-and-gbgbc) ·
+[Writing RAM](#writing-ram)
+
 ## Setup (once)
 
 **From npm** (no clone needed): point your MCP host at `npx -y gb-gbc-gba-test-mcp`
@@ -203,7 +210,9 @@ await emu.close();
 ```
 
 `launch(rom)` accepts any path; the ROM is served to the browser in place (nothing is
-copied).
+copied). The console comes from the extension, or for a `.zip` from the ROM file
+inside it. If Chromium is missing, the error says how to install it (or point
+`GBTEST_CHROMIUM` at an existing Chrome).
 
 The machine is **paused between calls** and only runs inside `waitFrames` /
 `waitUntilFrame` / `tap`, so a screenshot, RAM read or write always lands on exactly

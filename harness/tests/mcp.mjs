@@ -94,8 +94,10 @@ try {
   ok('save_state to file', !r.isError && existsSync(path.join(OUT, 'cp.state')), textOf(r));
   const shotAtCp = (await call('screenshot', { scale: 1 })).content[1].data;
   await call('press', { buttons: ['START', 'A'], hold: 6, release: 30 });
+  await call('save_state', {});
   r = await call('load_state', { path: 'harness/out/mcp-test/cp.state' });
   ok('load_state from file', !r.isError, textOf(r));
+  ok('loading a file keeps the named "default" state', (await call('status')).structuredContent.states.includes('default'));
   ok('state restore is pixel-exact', (await call('screenshot', { scale: 1 })).content[1].data === shotAtCp);
   ok('repeated screenshots are identical', (await call('screenshot', { scale: 1 })).content[1].data === shotAtCp);
   await call('write_memory', { address: '0x02000104', value: 7 });
@@ -132,6 +134,10 @@ try {
   ok('run_sequence failed assertRam -> isError', r.isError && r.structuredContent.failures === 1);
   r = await call('run_sequence', { steps: [{ bogus: 1 }] });
   ok('run_sequence rejects unknown steps', r.isError && /unknown step/.test(textOf(r)));
+  const before = (await call('export_script')).structuredContent.steps.length;
+  r = await call('run_sequence', { steps: [{ wait: 5 }, { tap: 'A' }, { bogus: 1 }] });
+  const afterSteps = (await call('export_script')).structuredContent.steps;
+  ok('steps before a failing step are still recorded', r.isError && afterSteps.length >= before + 1 && afterSteps.some((s) => s.tap === 'A'), `${before} -> ${afterSteps.length}`);
 
   // --- Resources ---
   const res = /** @type {any} */ (await client.readResource({ uri: 'emu://status' }));

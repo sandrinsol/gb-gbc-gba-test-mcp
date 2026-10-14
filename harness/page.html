@@ -18,10 +18,10 @@
     const params = new URLSearchParams(location.search);
     const rom = params.get('rom'); // absolute path served by the harness static server
 
-    // Pick the EmulatorJS system by ROM extension:
-    //   .gba -> 'gba' (mgba core), .gb/.gbc -> 'gb' (gambatte core).
+    // EmulatorJS system: given by the driver (which also looks inside .zip files),
+    // else by ROM extension: .gb/.gbc -> 'gb' (gambatte core), otherwise 'gba' (mgba).
     const ext = (rom || '').split('?')[0].split('.').pop().toLowerCase();
-    const system = ext === 'gb' || ext === 'gbc' ? 'gb' : 'gba';
+    const system = params.get('system') || (ext === 'gb' || ext === 'gbc' ? 'gb' : 'gba');
 
     // --- EmulatorJS config (headless + deterministic) ---
     window.EJS_player = '#game';

@@ -1,7 +1,8 @@
 # Game Boy Emulator + AI Test Harness (GB / GBC / GBA, fully offline)
 
-A dead-simple browser-based Game Boy Advance emulator. Everything it needs is
-bundled in the `data/` folder — **no internet connection required**, ever.
+A dead-simple browser-based emulator for Game Boy, Game Boy Color and Game Boy
+Advance. Everything it needs is bundled in the `data/` folder — **no internet
+connection required**, ever.
 
 Two ways to use it:
 
@@ -46,7 +47,7 @@ python3 -m http.server 8000
 Then click **Load ROM** and pick a `.gba`, `.gb`, or `.gbc` file.
 
 A free homebrew game, **`anguna.gba`**, is included so you can try it right away.
-Delete it if you don't want it — you can load any `.gba` ROM.
+Delete it if you don't want it — you can load any `.gba`, `.gb` or `.gbc` ROM.
 
 ## Default controls
 
@@ -84,12 +85,15 @@ files. (You no longer need `start.command`; that's only for running locally.)
 
 ## How it works
 
-The heavy lifting (ARM7TDMI CPU, graphics, audio) is done by the open-source
-[EmulatorJS](https://emulatorjs.org) `mgba` core. All of its files live locally:
+The heavy lifting (CPU, graphics, audio) is done by open-source
+[EmulatorJS](https://emulatorjs.org) cores: `mgba` for GBA and `gambatte` for
+GB/GBC, picked by the ROM's file extension. All of their files live locally:
 
 ```
-index.html            the page (~60 lines)
+index.html            the page (~90 lines)
 netlify.toml          static-hosting config for Netlify
+package.json          the npm package for the MCP server (see harness/)
+harness/              MCP server + headless test harness (see harness/README.md)
 start.command         one-click local server launcher (local use only)
 anguna.gba            sample freeware homebrew game
 data/

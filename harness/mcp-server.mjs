@@ -3,9 +3,13 @@
 //
 // Exposes the emulator to any MCP host (Claude Code, Claude Desktop, Cursor, ...)
 // as tools an AI agent can call to test the GB/GBC/GBA games it builds — no
-// third-party emulator program. screenshot returns the frame as an inline image so
-// the agent literally sees the game; read_memory reads real RAM out of a save state;
-// ram_search finds where a value lives; run_sequence plays a whole script per call.
+// third-party emulator program. Tools, in groups:
+//   play     load_rom, wait_frames, press, set_button, wait_until, reset
+//   look     screenshot, read_sprites, view_vram, read_cpu, read_memory
+//   change   write_memory, set_cheats, save_state/load_state, import_save
+//   test     run_sequence, assert_golden, export_script, ab_compare, export_save
+//   find     ram_search_start/filter/results
+// The machine is paused between calls, so every read lands on an exact frame.
 //
 // Run: node mcp-server.mjs   (stdio transport)
 // Library/tests: import { createServer } from './mcp-server.mjs'
@@ -128,7 +132,7 @@ export function createServer({ root = undefined, fast = true } = {}) {
   // ---- Tools ----
   tool('load_rom', {
     title: 'Load ROM',
-    description: 'Boot a GBA/GB/GBC ROM (.gba/.gb/.gbc/.zip) in the headless emulator, replacing any current ROM (saved states and RAM searches are cleared). The system is auto-detected from the extension. Relative paths resolve against the workspace root. The emulator is paused between calls and only runs inside waits, so every read is frame-exact.',
+    description: 'Boot a GBA/GB/GBC ROM (.gba/.gb/.gbc, or a .zip holding one) in the headless emulator, replacing any current ROM — saved states, cheats, the RAM search and the export_script recording start fresh. The console is detected from the file (or the file inside the .zip). Relative paths resolve against the workspace root. The emulator is paused between calls and only runs inside waits, so every read is frame-exact.',
     inputSchema: {
       rom: z.string().describe('Path to the ROM file'),
       fast: z.boolean().default(fast).describe('Fast-forward long waits (results are bit-identical to real-time)'),
@@ -214,12 +218,12 @@ export function createServer({ root = undefined, fast = true } = {}) {
     const d = await emu.videoDimensions();
     const frame = await emu.frameNum();
     let saved;
-    record({ shot: `f${frame}` });
     if (save) {
       saved = await writePath(save);
       await mkdir(path.dirname(saved), { recursive: true });
       await writeFile(saved, buf);
     }
+    record({ shot: `f${frame}` });
     const warn = stale ? ' NOTE: this state was loaded from a file made outside this session, so its picture is unknown — this is the last frame rendered before the load; wait_frames 1 to see the real screen.' : '';
     return result(`Frame ${frame} of ${romName} (${d.w}x${d.h}, shown at ${scale}x)${saved ? `; saved ${saved}` : ''}.${warn}`,
       { frame, width: d.w, height: d.h, stale, ...(saved ? { saved } : {}) }, [png(scalePng(buf, scale))]);
@@ -306,7 +310,7 @@ export function createServer({ root = undefined, fast = true } = {}) {
     description: 'Restore a saved state by name, or from a file written by save_state (`path`). The state must come from the same ROM/console.',
     inputSchema: {
       id: z.string().default('default'),
-      path: z.string().optional().describe('Load from this file instead of a named in-memory state'),
+      path: z.string().optional().describe('Load from this file instead of a named in-memory state (`id` is then ignored)'),
     },
     outputSchema: FrameOut,
     annotations: ACT,
@@ -314,7 +318,6 @@ export function createServer({ root = undefined, fast = true } = {}) {
     let st;
     if (p) {
       st = await readFile(await resolvePath(p));
-      states.set(id, st);
     } else {
       st = states.get(id);
       if (!st) return errText(`No saved state "${id}". Saved: ${[...states.keys()].join(', ') || 'none'}.`);
@@ -370,13 +373,14 @@ States saved here are shared with save_state/load_state.`,
   }, async ({ steps, scale, outDir, maxImages }) => {
     const out = outDir ? await writePath(outDir) : undefined;
     const bd = await baseDir();
-    const res = await runSteps(emu, steps, { outDir: out, baseDir: bd, states, checkWrite: await writeGuard() });
-    // Record with absolute paths so an exported script replays from anywhere.
-    for (const st of steps) {
+    // Record each step as it completes (with absolute paths, so an exported script
+    // replays from anywhere) — if a later step throws, what already ran is kept.
+    const onStep = (st) => {
       const c = { ...st };
       for (const k of ['assert', 'loadStateFile', 'importSave']) if (typeof c[k] === 'string') c[k] = path.resolve(bd, c[k]);
       record(c);
-    }
+    };
+    const res = await runSteps(emu, steps, { outDir: out, baseDir: bd, states, checkWrite: await writeGuard(), onStep });
     const frame = await emu.frameNum();
     if (out) await writeFile(path.join(out, 'timeline.json'), JSON.stringify({ rom: romPath, pass: res.failures === 0, steps: res.timeline }, null, 2));
 

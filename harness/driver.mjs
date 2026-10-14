@@ -16,7 +16,7 @@
 //   node driver.mjs shot <rom> [frames=300] [out.png=out/shot.png]
 
 import http from 'node:http';
-import { writeFile, stat, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, stat, mkdir } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { createReadStream, realpathSync } from 'node:fs';
 import path from 'node:path';
@@ -33,6 +33,27 @@ const MIME = {
   '.data': 'application/octet-stream', '.gba': 'application/octet-stream',
   '.png': 'image/png', '.map': 'application/json',
 };
+
+const SYSTEM_BY_EXT = { gb: 'gb', gbc: 'gb', gba: 'gba' };
+
+/** Which core a ROM needs: by extension, and for a .zip by the first ROM file
+ *  inside it (read from the archive's local file headers). 'gb' covers GB + GBC. */
+export async function romSystem(absRom) {
+  const ext = path.extname(absRom).slice(1).toLowerCase();
+  if (SYSTEM_BY_EXT[ext]) return SYSTEM_BY_EXT[ext];
+  if (ext === 'zip') {
+    const zip = await readFile(absRom);
+    for (let p = 0; p + 30 <= zip.length && zip.readUInt32LE(p) === 0x04034b50;) {
+      const nameLen = zip.readUInt16LE(p + 26), extraLen = zip.readUInt16LE(p + 28), size = zip.readUInt32LE(p + 18);
+      const name = zip.toString('utf8', p + 30, p + 30 + nameLen);
+      const sys = SYSTEM_BY_EXT[path.extname(name).slice(1).toLowerCase()];
+      if (sys) return sys;
+      if (zip.readUInt16LE(p + 6) & 0x08) break; // sizes live in a trailing descriptor; stop
+      p += 30 + nameLen + extraLen + size;
+    }
+  }
+  return 'gba';
+}
 
 // Serves the repo root, plus each loaded ROM in place at /__rom/<token>/<name>
 // (no copying, so ROMs can live anywhere and the install dir can be read-only).
@@ -70,17 +91,28 @@ async function startHost({ headless = true } = {}) {
   const { chromium } = await import('playwright');
   const roms = new Map(); // token -> absolute ROM path
   const { server, port } = await startServer(ROOT, roms);
-  const browser = await chromium.launch({
-    headless,
-    // Optional: use a preinstalled Chromium instead of Playwright's download.
-    executablePath: process.env.GBTEST_CHROMIUM || undefined,
-    args: [
-      '--use-gl=angle', '--use-angle=swiftshader',
-      '--ignore-gpu-blocklist', '--enable-webgl',
-      '--autoplay-policy=no-user-gesture-required',
-      '--mute-audio', '--hide-scrollbars',
-    ],
-  });
+  let browser;
+  try {
+    browser = await chromium.launch({
+      headless,
+      // Optional: use a preinstalled Chromium instead of Playwright's download.
+      executablePath: process.env.GBTEST_CHROMIUM || undefined,
+      args: [
+        '--use-gl=angle', '--use-angle=swiftshader',
+        '--ignore-gpu-blocklist', '--enable-webgl',
+        '--autoplay-policy=no-user-gesture-required',
+        '--mute-audio', '--hide-scrollbars',
+      ],
+    });
+  } catch (e) {
+    await new Promise((r) => server.close(r));
+    if (/executable doesn't exist|ENOENT/i.test(e.message)) {
+      throw new Error('Chromium is not installed. Run `npx playwright install chromium` (in the folder with this package), '
+        + 'or set GBTEST_CHROMIUM to an existing Chrome/Chromium binary.'
+        + (process.env.GBTEST_CHROMIUM ? ` (GBTEST_CHROMIUM=${process.env.GBTEST_CHROMIUM} was not found.)` : ''));
+    }
+    throw e;
+  }
   return {
     browser, server, port, roms,
     async close() { await browser.close().catch(() => {}); await new Promise((r) => server.close(r)); },
@@ -138,7 +170,8 @@ export class EmuHarness {
       host.roms.delete(romToken);
       if (!reuse) await host.close();
     };
-    const url = `http://127.0.0.1:${host.port}/harness/page.html?rom=${encodeURIComponent(romUrlPath)}${fast ? '' : '&fast=0'}`;
+    const sys = await romSystem(absRom);
+    const url = `http://127.0.0.1:${host.port}/harness/page.html?rom=${encodeURIComponent(romUrlPath)}&system=${sys}${fast ? '' : '&fast=0'}`;
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded' });
       await page.waitForFunction(() => window.EJS_emulator && window.EJS_emulator.gameManager, { timeout });
