@@ -174,11 +174,10 @@ Golden comparison (`assert.mjs`), RAM search (`ramsearch.mjs`), video encoding
 - **Colours** are the ones the game sets: GBC colour correction is off in the harness
   (the play page keeps it).
 - **Video** is captured frame by frame (identical to screenshots of those frames), at
-  real-time speed. **Audio** stays in step with the frames and is identical across runs
-  unless something rewound the machine first (a screenshot, state load, RAM write or a
-  fast-forward recovery runs one frame of the old timeline into the audio resampler;
-  `stats().rewinds` counts them). It goes into `.mp4`/`.webm` when a full ffmpeg is
-  installed (Playwright's has no audio encoders).
+  real-time speed. **Audio** stays in step with the frames but is not bit-exact
+  across runs (a screenshot, state load, RAM write or fast-forward recovery runs one
+  frame of the old timeline into the audio resampler). It goes into `.mp4`/`.webm`
+  when a full ffmpeg is installed (Playwright's has no audio encoders).
 - **Injected sprites** stay only if the game doesn't rewrite that sprite-table entry
   each frame; the tool says when it did. `overlay` previews without touching the game.
 - **Golden images** depend on the software renderer; regenerate them with

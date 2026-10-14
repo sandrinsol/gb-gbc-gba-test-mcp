@@ -140,8 +140,8 @@
     // AudioBuffer per chunk. Normally the driver drops or repeats chunks depending
     // on the real audio clock (suspended in headless Chrome); driving that clock
     // from the emulated frame counter instead keeps the stream in step with the
-    // frames and identical across runs — as long as nothing rewinds the machine:
-    // every restore (screenshot, state load, RAM write, fast-forward recovery)
+    // frames. It is not bit-exact across runs: chunk boundaries can shift by one,
+    // and every restore (screenshot, state load, RAM write, fast-forward recovery)
     // runs one frame of the abandoned timeline, whose sound goes into RetroArch's
     // resampler and can't be taken back (Emu.stats.rewinds counts them). The
     // picture and RAM are unaffected. While recording, chunks are collected.
