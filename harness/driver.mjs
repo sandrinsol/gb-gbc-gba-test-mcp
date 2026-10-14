@@ -23,6 +23,8 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as gbaMem from './memory.mjs';
 import * as gbMem from './gb-memory.mjs';
+import { gbaSprites, gbSprites } from './video.mjs';
+import { renderSprite } from './sprite.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..'); // the repo root (served to the browser)
@@ -191,7 +193,7 @@ export class EmuHarness {
 
     // Hold the machine still between calls (it only runs inside waits).
     // Hold the machine still between calls (it only runs inside waits).
-    const system = await page.evaluate(() => { window.Emu.pause(); return window.Emu.system; });
+    const system = await page.evaluate(() => { window.Emu.pause(); window.Emu.initAudio(); return window.Emu.system; });
     return new EmuHarness({ host, shared: reuse, context, page, romToken, system, blocked });
   }
 
@@ -290,6 +292,13 @@ export class EmuHarness {
     await this._poke(state);
     return (await this.readMemory(addr, bytes.length)).equals(bytes);
   }
+  /** Patch the current state in one go: fn(stateCopy, memModule) edits it, then it
+   *  is loaded on the same frame (the picture is kept). */
+  async patchState(fn) {
+    const state = Buffer.from(await this._rawState());
+    await fn(state, this._mem);
+    await this._poke(state);
+  }
   async _poke(state) {
     this._state = null;
     await this.page.evaluate((b) => window.Emu.pokeState(b), state.toString('base64'));
@@ -320,6 +329,62 @@ export class EmuHarness {
     Buffer.from(data).copy(dst);
     await this._poke(state);
     if (reset) await this.restart();
+  }
+
+  // ---- Sprites ----
+  /** Decoded sprite table (see video.mjs gbaSprites / gbSprites). */
+  async sprites() {
+    const r = await this.readRegions();
+    return this.system === 'gba' ? gbaSprites(r) : gbSprites(r, { cgb: !!r.isCgbWram });
+  }
+  /** Sprite `index`'s graphics as an RGBA PNG, read from VRAM (independent of
+   *  what's behind it — handy for per-sprite golden checks). */
+  async spriteImage(index) {
+    const list = await this.sprites();
+    if (!list[index]) throw new Error(`no sprite ${index} (0-${list.length - 1})`);
+    return renderSprite(this.system, await this.readRegions(), list[index]);
+  }
+
+  // ---- Recording ----
+  /** Start capturing frames: every `every`-th frame while the game runs (waits
+   *  run at 1x meanwhile), keeping the last `maxFrames` captures. */
+  async startRecording({ every = 1, maxFrames = 600 } = {}) {
+    await this.page.evaluate(([e, m]) => window.Emu.recStart(e, m), [every, maxFrames]);
+  }
+  /** Stop capturing → [{ frame, png: Buffer }] in frame order. The array also
+   *  carries `.audio` = { rate, channels, pcm: Buffer (s16le interleaved) } or null. */
+  async stopRecording() {
+    const { frames, audio } = await this.page.evaluate(() => window.Emu.recStop());
+    const out = frames.map((f) => ({ frame: f.frame, png: Buffer.from(f.png, 'base64') }));
+    /** @type {any} */ (out).audio = audio ? { rate: audio.rate, channels: audio.channels, pcm: Buffer.from(audio.pcm, 'base64') } : null;
+    return out;
+  }
+  get recording() { return this.page.evaluate(() => !!window.Emu._rec); }
+  /** PNG Buffers → JPEG Buffers upscaled by `scale` with no smoothing (encoded by
+   *  the browser; used to feed Playwright's JPEG-only ffmpeg). */
+  async toJpeg(pngs, scale = 1) {
+    const out = await this.page.evaluate(async ([list, k]) => {
+      const res = [];
+      for (const b64 of list) {
+        const bmp = await createImageBitmap(new Blob([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], { type: 'image/png' }));
+        const c = new OffscreenCanvas(bmp.width * k, bmp.height * k);
+        const ctx = c.getContext('2d');
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(bmp, 0, 0, c.width, c.height);
+        const blob = await c.convertToBlob({ type: 'image/jpeg', quality: 0.95 });
+        const u8 = new Uint8Array(await blob.arrayBuffer());
+        let s = '';
+        for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+        res.push(btoa(s));
+      }
+      return res;
+    }, [pngs.map((p) => p.toString('base64')), scale]);
+    return out.map((b) => Buffer.from(b, 'base64'));
+  }
+  /** Advance `frames` frames, capturing every `every`-th (frame-exact). */
+  async record(frames, { every = 1 } = {}) {
+    await this.startRecording({ every, maxFrames: Math.ceil(frames / every) + 2 });
+    try { await this.waitFrames(frames); } finally { return this.stopRecording(); }
   }
 
   // ---- Cheats ----

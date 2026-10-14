@@ -14,16 +14,23 @@
 //   { "assertRam": "0x03000010", "as": "u16", "equals": 3, "name": "hp" }
 //   { "assert": "goldens/title.png", "threshold": 0.02, "name": "title",
 //     "ignore": [{ "x": 200, "y": 0, "w": 40, "h": 16 }] }
+//   { "assert": "goldens/hero.png", "sprite": 0 }    one sprite's graphics only
 //   { "waitUntil": { "address": "0xC000", "op": "eq", "value": 3 }, "maxFrames": 600 }
 //   { "waitUntil": { "screen": "stable", "frames": 30 } }
 //   { "reset": true }                               reset button (battery save kept)
 //   { "cheats": ["01AAD0C0"] }                      replace the active cheat codes
 //   { "loadStateFile": "states/boss.state" }        a state saved to disk
 //   { "importSave": "saves/100pct.sav" }            load a battery save + reset
+//   { "video": { "frames": 120, "path": "clips/walk.gif", "every": 1, "scale": 2 } }
+//                                                   record the next N frames to a file
+//
+// runSteps(..., { video: { path, onlyOnFail, seconds } }) records the whole run
+// and keeps the last `seconds` — e.g. a clip of what led up to a failure.
 
 import path from 'node:path';
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import { assertGolden } from './assert.mjs';
+import { saveVideo } from './recording.mjs';
 
 /** Parse a bus address given as a number or a string ("0x03000010", "$C000",
  *  "C000h", or decimal digits). JSON has no hex literals, so agents send strings. */
@@ -75,10 +82,33 @@ const asList = (b) => (Array.isArray(b) ? b : [b]);
  * @param {(absPath: string) => void} [opts.checkWrite]  throws to refuse writing there
  * @param {(step: Record<string, any>) => void} [opts.onStep]  called after each step
  *   completes (so a caller can record what actually ran, even if a later step throws)
+ * @param {{ path: string, onlyOnFail?: boolean, seconds?: number, every?: number, scale?: number }} [opts.video]
+ *   record the run (last `seconds`, default 10) to `path`; with onlyOnFail
+ *   (default true) the file is only written when a step fails or throws
  * @returns {Promise<{ timeline: any[], shots: Array<{name: string, frame: number, png: Buffer, file?: string}>,
- *   records: Array<{prefix: string, frames: number[], pngs: Buffer[], files: string[]}>, failures: number }>}
+ *   records: Array<{prefix: string, frames: number[], pngs: Buffer[], files: string[]}>, failures: number, video?: string | null }>}
  */
-export async function runSteps(emu, steps, { outDir, baseDir = process.cwd(), states = new Map(), log = () => {}, checkWrite = () => {}, onStep = () => {} } = {}) {
+export async function runSteps(emu, steps, opts = {}) {
+  const { video, baseDir = process.cwd(), checkWrite = () => {} } = opts;
+  if (!video) return runPlain(emu, steps, opts);
+  const file = path.resolve(baseDir, video.path);
+  checkWrite(file);
+  const every = video.every ?? 1;
+  await emu.startRecording({ every, maxFrames: Math.ceil((video.seconds ?? 10) * 60 / every) });
+  let res, error;
+  try { res = await runPlain(emu, steps, opts); } catch (e) { error = e; }
+  const caps = await emu.stopRecording();
+  const failed = !!error || res.failures > 0;
+  let saved = null;
+  if (caps.length && (failed || video.onlyOnFail === false)) {
+    saved = (await saveVideo(caps, file, { scale: video.scale ?? 2, every, toJpeg: (p, k) => emu.toJpeg(p, k) })).file;
+  }
+  if (error) { if (saved) error.message += ` (video: ${saved})`; throw error; }
+  return { ...res, video: saved };
+}
+
+/** runSteps without whole-run recording. @param {any} emu @param {any} steps @param {any} [opts] */
+async function runPlain(emu, steps, { outDir, baseDir = process.cwd(), states = new Map(), log = () => {}, checkWrite = () => {}, onStep = () => {} } = {}) {
   if (!Array.isArray(steps)) throw new Error('steps must be an array');
   if (outDir) { checkWrite(outDir); await mkdir(outDir, { recursive: true }); }
   const timeline = [], shots = [], records = [];
@@ -134,6 +164,17 @@ export async function runSteps(emu, steps, { outDir, baseDir = process.cwd(), st
       records.push(rec);
       entry.frames = rec.frames;
       if (outDir) entry.files = rec.files;
+    } else if ('video' in step) {
+      const v = step.video;
+      if (!v.path || !v.frames) throw new Error(`step ${i}: video needs "frames" and "path"`);
+      if (await emu.recording) throw new Error(`step ${i}: a video step can't run while the whole run is being recorded`);
+      const file = path.resolve(baseDir, v.path);
+      checkWrite(file);
+      const caps = await emu.record(v.frames, { every: v.every ?? 1 });
+      const r = await saveVideo(caps, file, { scale: v.scale ?? 2, every: v.every ?? 1, audio: v.audio ?? 'auto', toJpeg: (p, k) => emu.toJpeg(p, k) });
+      entry.action = `video ${v.frames}f`;
+      entry.file = r.file;
+      if (r.audio) entry.audio = r.audio;
     } else if ('saveState' in step) {
       entry.action = `saveState ${step.saveState}`;
       states.set(step.saveState, await emu.saveState());
@@ -186,8 +227,9 @@ export async function runSteps(emu, steps, { outDir, baseDir = process.cwd(), st
     } else if ('assert' in step) {
       const name = step.name || path.basename(step.assert).replace(/\.png$/i, '');
       entry.action = `assert ${name}`;
-      const s = await snap(name);
-      if (s.file) entry.file = s.file;
+      let s;
+      if (step.sprite !== undefined) s = { png: await emu.spriteImage(step.sprite) };
+      else { s = await snap(name); if (s.file) entry.file = s.file; }
       const golden = path.resolve(baseDir, step.assert);
       checkWrite(golden);
       const res = await assertGolden(s.png, golden, {

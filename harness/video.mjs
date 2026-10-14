@@ -31,7 +31,7 @@ export function gbaSprites(regions) {
     const W = w * dbl, H = h * dbl;
     out.push({
       index: i, x, y, w: W, h: H, tile: a2 & 0x3ff, palette: a2 >> 12, priority: (a2 >> 10) & 3,
-      hflip: !affine && !!(a1 & 0x1000), vflip: !affine && !!(a1 & 0x2000), affine,
+      hflip: !affine && !!(a1 & 0x1000), vflip: !affine && !!(a1 & 0x2000), affine, dbl: dbl === 2,
       mode: ['normal', 'semi-transparent', 'window', 'prohibited'][(a0 >> 10) & 3], bpp8: !!(a0 & 0x2000),
       hidden, onScreen: !hidden && x < 240 && x + W > 0 && y < 160 && y + H > 0,
     });

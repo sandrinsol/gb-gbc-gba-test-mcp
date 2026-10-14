@@ -89,3 +89,27 @@ export function makeZip(name, data) {
   end.writeUInt32LE(46 + n.length, 12); end.writeUInt32LE(30 + n.length + data.length, 16);
   return Buffer.concat([local, n, data, central, n, end]);
 }
+
+// GBC-only ROM: writes 0xB0+bank to 0xD000 of every WRAM bank, selects SVBK=2,
+// turns the LCD on and idles.
+export function makeCgbRom() {
+  const rom = Buffer.alloc(0x8000, 0);
+  rom[0x100] = 0x00; rom[0x101] = 0xc3; rom[0x102] = 0x50; rom[0x103] = 0x01; // nop; jp 0x150
+  Buffer.from('CGBBANK').copy(rom, 0x134);
+  rom[0x143] = 0xc0; // CGB-only flag -> gambatte runs in CGB mode (32KB WRAM)
+  const code = [
+    0x3e, 0xb0, 0xea, 0x00, 0xc0,       // 0x150 ld a,0xB0; ld (C000),a   (bank 0 sentinel)
+    0x0e, 0x01,                         // 0x155 ld c,1
+    // loop (0x157): SVBK=c; write 0xB0+c to 0xD000
+    0x79, 0xe0, 0x70,                   // 0x157 ld a,c; ldh (70),a       (SVBK=c)
+    0x3e, 0xb0, 0x81, 0xea, 0x00, 0xd0, // 0x15a ld a,0xB0; add a,c; ld (D000),a
+    0x0c, 0x79, 0xfe, 0x08,             // 0x160 inc c; ld a,c; cp 8
+    0x20, 0xf1,                         // 0x164 jr nz,-15 -> 0x157
+    0x3e, 0x02, 0xe0, 0x70,             // 0x166 ld a,2; ldh (70),a       (select SVBK=2)
+    0x3e, 0x91, 0xe0, 0x40,             // 0x16a ld a,0x91; ldh (40),a    (LCD on)
+    0x18, 0xfe,                         // 0x16e jr $                     (halt loop)
+  ];
+  for (let i = 0; i < code.length; i++) rom[0x150 + i] = code[i];
+  let x = 0; for (let i = 0x134; i <= 0x14c; i++) x = (x - rom[i] - 1) & 0xff; rom[0x14d] = x;
+  return rom;
+}

@@ -1,0 +1,46 @@
+# Runs every tests/gb/*.json step script against the game's ROM.
+name: gb-tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gb-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build the ROM here with your toolchain, e.g.:
+      #   container: devkitpro/devkitarm   (then: run: make)
+      # or download it from an earlier job's artifact.
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Fetch the test harness
+        run: |
+          git clone --depth 1 https://github.com/sandrinsol/gb-gbc-gba-test-mcp "$RUNNER_TEMP/gbtest"
+          cd "$RUNNER_TEMP/gbtest/harness"
+          npm ci --ignore-scripts
+          npx playwright install --with-deps chromium
+
+      - name: Run the scripts
+        run: |
+          status=0
+          for script in tests/gb/*.json; do
+            echo "::group::$script"
+            node "$RUNNER_TEMP/gbtest/harness/runner.mjs" "$script" "out/$(basename "$script" .json)" || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gb-test-results
+          path: |
+            out/
+            tests/gb/goldens/*.diff.png
+            tests/gb/failures/
